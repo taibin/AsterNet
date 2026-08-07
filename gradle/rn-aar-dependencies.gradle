@@ -1,0 +1,97 @@
+import groovy.json.JsonSlurper
+
+def parseEnvList = { String value ->
+    if (value == null || value.trim().isEmpty()) {
+        return [] as Set
+    }
+    return value.split(',').collect { it.trim() }.findAll { !it.isEmpty() } as Set
+}
+
+ext.isRnAarEnabled = {
+    return (System.getenv('RN_USE_THIRD_PARTY_AARS') ?: 'true') == 'true'
+}
+
+ext.resolveRnAarManifest = {
+    File manifestFile = rootProject.file('tools/rn-aar/generated/manifest.json')
+    if (!manifestFile.exists()) {
+        if (isRnAarEnabled()) {
+            throw new GradleException(
+                'RN_USE_THIRD_PARTY_AARS is true but tools/rn-aar/generated/manifest.json is missing. ' +
+                    'Generate the inventory first: `node tools/rn-aar/generate-inventory.js` or `yarn rn-aar:inventory`.'
+            )
+        }
+        return null
+    }
+    return new JsonSlurper().parse(manifestFile)
+}
+
+ext.resolveRnAarCoordinates = {
+    if (!isRnAarEnabled()) {
+        return []
+    }
+
+    def manifest = resolveRnAarManifest()
+    if (manifest == null) {
+        return []
+    }
+
+    def includePackages = parseEnvList(System.getenv('RN_AAR_INCLUDE_PACKAGES'))
+    def excludePackages = parseEnvList(System.getenv('RN_AAR_EXCLUDE_PACKAGES'))
+
+    def sdkOwnedPackages = [
+        'react-native-record-screen'
+    ] as Set
+
+    return manifest.packages.findAll { item ->
+        item.publishable &&
+            !sdkOwnedPackages.contains(item.packageName) &&
+            (includePackages.isEmpty() || includePackages.contains(item.packageName)) &&
+            !excludePackages.contains(item.packageName)
+    }.collect { item ->
+        def version = item.aarVersion ?: item.packageVersion
+        [
+            packageName: item.packageName,
+            coordinate : "${item.groupId}:${item.baseArtifactId}:${version}"
+        ]
+    }
+}
+
+ext.addRnAarDependencies = { DependencyHandler dependencyHandler ->
+    resolveRnAarCoordinates().each { item ->
+        dependencyHandler.add('implementation', item.coordinate)
+    }
+}
+
+tasks.register('printReactNativeAarDependencies') {
+    doLast {
+        def coordinates = resolveRnAarCoordinates()
+        println("rnAarEnabled=${isRnAarEnabled()}")
+        if (coordinates.isEmpty()) {
+            println('No React Native AAR dependencies selected.')
+            return
+        }
+        coordinates.each { item ->
+            println("${item.packageName} -> ${item.coordinate}")
+        }
+    }
+}
+
+if (isRnAarEnabled()) {
+    def consumeRepository = System.getenv('RN_AAR_MAVEN_CONSUME_URL')
+    if (consumeRepository != null && !consumeRepository.trim().isEmpty()) {
+        project.repositories {
+            maven {
+                url consumeRepository
+                // 凭证从 ~/.gradle/gradle.properties 读取（不提交 git）
+                def nexusUser = findProperty('NEXUS_USERNAME') ?: ''
+                def nexusPass = findProperty('NEXUS_PASSWORD') ?: ''
+                if (nexusUser && nexusPass) {
+                    credentials {
+                        username nexusUser
+                        password nexusPass
+                    }
+                }
+            }
+        }
+    }
+}

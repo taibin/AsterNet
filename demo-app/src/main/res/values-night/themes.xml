@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.AsterNetDemo" parent="Theme.Material3.Dark.NoActionBar">
+        <item name="colorPrimary">@color/primary</item>
+        <item name="colorOnPrimary">@color/on_primary</item>
+        <item name="colorPrimaryContainer">@color/primary_container</item>
+        <item name="colorOnPrimaryContainer">@color/on_primary_container</item>
+
+        <item name="colorSecondary">@color/secondary</item>
+        <item name="colorOnSecondary">@color/on_secondary</item>
+        <item name="colorSecondaryContainer">@color/secondary_container</item>
+        <item name="colorOnSecondaryContainer">@color/on_secondary_container</item>
+
+        <item name="colorTertiary">@color/tertiary</item>
+        <item name="colorOnTertiary">@color/on_tertiary</item>
+        <item name="colorTertiaryContainer">@color/tertiary_container</item>
+        <item name="colorOnTertiaryContainer">@color/on_tertiary_container</item>
+
+        <item name="colorSurface">@color/on_surface</item>
+        <item name="colorOnSurface">@color/surface</item>
+        <item name="colorSurfaceVariant">@color/on_surface_variant</item>
+        <item name="colorOnSurfaceVariant">@color/surface_variant</item>
+
+        <item name="colorError">@color/on_error</item>
+        <item name="colorOnError">@color/error</item>
+        <item name="colorErrorContainer">@color/on_error_container</item>
+        <item name="colorOnErrorContainer">@color/error_container</item>
+
+        <item name="android:colorBackground">@color/on_background</item>
+        <item name="colorOnBackground">@color/background</item>
+
+        <item name="colorOutline">@color/outline_variant</item>
+        <item name="colorOutlineVariant">@color/outline</item>
+
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+</resources>

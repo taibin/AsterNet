@@ -1,0 +1,10 @@
+# 运行时生成的自签名证书（首次 go run main.go 生成），不入库
+/cert.pem
+/key.pem
+
+# 本地编译产物
+/hs-server
+*.test
+
+# Go
+/vendor/

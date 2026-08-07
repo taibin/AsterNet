@@ -1,0 +1,43 @@
+# 构建产物
+/build/
+/build-*/
+/out/
+
+# IDE
+/.idea/
+/.vscode/
+*.xcodeproj
+*.xcworkspace
+.DS_Store
+.cxx
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.cmake.user
+
+# 编译产物
+*.o
+*.obj
+*.so
+*.a
+*.dylib
+*.dll
+*.exe
+
+# 第三方源码（POC 阶段以 submodule 引入，不入库）
+/third_party/xquic/
+/third_party/breakpad/
+
+# 符号表（发版归档，不入库）
+/symbols/
+
+# Android
+/android/.gradle/
+/android/build/
+/android/local.properties
+
+# iOS
+/ios/build/
+/ios/Pods/

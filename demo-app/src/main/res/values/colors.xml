@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Material 3 主色调：深靛蓝 / 紫罗兰 -->
+    <color name="primary">#FF4A5C9E</color>
+    <color name="on_primary">#FFFFFFFF</color>
+    <color name="primary_container">#FFDCE1FF</color>
+    <color name="on_primary_container">#FF001452</color>
+
+    <!-- 辅助色：蓝灰 -->
+    <color name="secondary">#FF585E71</color>
+    <color name="on_secondary">#FFFFFFFF</color>
+    <color name="secondary_container">#FFDCE2F9</color>
+    <color name="on_secondary_container">#FF151B2C</color>
+
+    <!-- 第三色：青绿 -->
+    <color name="tertiary">#FF006B59</color>
+    <color name="on_tertiary">#FFFFFFFF</color>
+    <color name="tertiary_container">#FF7AF8D9</color>
+    <color name="on_tertiary_container">#FF002118</color>
+
+    <!-- 表面 / 背景 -->
+    <color name="surface">#FFFEFBFF</color>
+    <color name="on_surface">#FF1B1B1F</color>
+    <color name="surface_variant">#FFE3E1EC</color>
+    <color name="on_surface_variant">#FF45464F</color>
+
+    <color name="background">#FFFEFBFF</color>
+    <color name="on_background">#FF1B1B1F</color>
+
+    <!-- 错误色 -->
+    <color name="error">#FFBA1A1A</color>
+    <color name="on_error">#FFFFFFFF</color>
+    <color name="error_container">#FFFFDAD6</color>
+    <color name="on_error_container">#FF410002</color>
+
+    <!-- 轮廓 / 分割线 -->
+    <color name="outline">#FF757680</color>
+    <color name="outline_variant">#FFC5C4D0</color>
+</resources>

@@ -1,0 +1,6 @@
+// asternet Demo Android 工程
+// 协议切换网络请求 Demo（HTTP/1.1 + HTTP/2 + HTTP/3）
+
+plugins {
+    id 'com.android.application' version '8.12.0' apply false
+}

@@ -1,0 +1,10 @@
+/* AsterNet version constants. */
+#ifndef ASTERNET_VERSION_H
+#define ASTERNET_VERSION_H
+
+#define ASTERNET_VERSION_MAJOR 0
+#define ASTERNET_VERSION_MINOR 1
+#define ASTERNET_VERSION_PATCH 0
+#define ASTERNET_VERSION_STRING "0.1.0"
+
+#endif  /* ASTERNET_VERSION_H */
