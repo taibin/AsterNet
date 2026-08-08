@@ -1,0 +1,6 @@
+# Default ignored files
+/.claude
+/.gradle
+/.idea
+/build
+local.properties

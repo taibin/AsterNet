@@ -45,23 +45,23 @@ endif()
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 # ---- 核心库 ----
-add_subdirectory(src)
+add_subdirectory(sdk/cxx)
 
 # ---- 测试 ----
 if(ASTERNET_BUILD_TESTS)
     enable_testing()
-    add_subdirectory(tests)
+    add_subdirectory(examples/cxx)
 endif()
 
 # ---- 端侧壳 ----
 if(ASTERNET_BUILD_ANDROID)
-    add_subdirectory(android)
+    add_subdirectory(sdk/android)
 endif()
 
 if(ASTERNET_BUILD_IOS)
-    add_subdirectory(ios)
+    add_subdirectory(sdk/ios)
 endif()
 
 # ---- 安装 ----
 include(GNUInstallDirs)
-install(DIRECTORY include/asternet DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(DIRECTORY sdk/cxx/public/asternet DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/asternet)

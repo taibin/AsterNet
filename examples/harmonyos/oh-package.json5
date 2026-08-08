@@ -1,0 +1,9 @@
+{
+  "name": "asternet.demo",
+  "version": "1.0.0",
+  "description": "AsterNet HarmonyOS Demo",
+  "main": "",
+  "author": "",
+  "license": "Apache-2.0",
+  "dependencies": {}
+}

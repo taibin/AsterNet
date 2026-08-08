@@ -1,0 +1,38 @@
+name: AsterNetDemo
+options:
+  bundleIdPrefix: io.asternet.demo
+  deploymentTarget:
+    iOS: "16.0"
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    CLANG_CXX_LANGUAGE_STANDARD: "c++17"
+    HEADER_SEARCH_PATHS:
+      - "$(SRCROOT)/../../sdk/cxx/public"
+      - "$(SRCROOT)/../../sdk/third_party/nghttp2/lib/includes"
+      - "$(SRCROOT)/../../sdk/third_party/xquic/include"
+      - "$(SRCROOT)/../../sdk/third_party/xquic/third_party/boringssl/include"
+    LIBRARY_SEARCH_PATHS:
+      - "$(SRCROOT)/../../sdk/cxx/build"
+      - "$(SRCROOT)/../../sdk/third_party/nghttp2/build"
+      - "$(SRCROOT)/../../sdk/third_party/xquic/third_party/boringssl/build"
+    OTHER_LDFLAGS:
+      - "-lasternet"
+      - "-lnghttp2"
+      - "-lssl"
+      - "-lcrypto"
+      - "-lxquic"
+    ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+
+targets:
+  AsterNetDemo:
+    type: application
+    platform: iOS
+    sources:
+      - path: AsterNetDemo
+    settings:
+      base:
+        INFOPLIST_FILE: AsterNetDemo/Info.plist
+        PRODUCT_BUNDLE_IDENTIFIER: io.asternet.demo.ios
+        SWIFT_OBJC_BRIDGING_HEADER: AsterNetDemo/AsterNetDemo-Bridging-Header.h

@@ -6,13 +6,13 @@
 
 ```bash
 # 1. 设置第三方依赖
-./setup-third-party.sh --local third_party/xquic third_party/nghttp2
+./scripts/setup-third-party.sh --local third_party/xquic third_party/nghttp2
 
 # 2. 构建 Demo APK
-./gradlew :demo-app:assembleDebug
+./gradlew :examples:android:assembleDebug
 
 # 3. 安装到设备
-adb install -r demo-app/build/outputs/apk/debug/demo-app-debug.apk
+adb install -r examples/android/build/outputs/apk/debug/android-debug.apk
 ```
 
 如果没有本地编译好的 xquic/nghttp2，需要先从 GitHub Releases 下载预编译库：
@@ -70,7 +70,18 @@ gh release create libs-v1 third_party_release/* \
   --notes "nghttp2 + xquic + BoringSSL 预编译静态库"
 ```
 
-## 桌面构建
+## 构建
+
+```bash
+# 统一构建入口
+./scripts/build.sh --android          # 仅 Android
+./scripts/build.sh --android --debug  # Android Debug（可调试）
+./scripts/build.sh --cxx              # C++ 核心 + 测试
+./scripts/build.sh --cxx --test       # 编译并运行测试
+./scripts/build.sh --all              # 全平台
+```
+
+### 桌面构建
 
 需要 CMake ≥ 3.18、C++17、以及预编译的 nghttp2 和 BoringSSL：
 
@@ -101,10 +112,10 @@ cmake -S . -B build -DASTERNET_REGISTER_NETWORK_TESTS=ON
 CMake 会自动从以下路径查找预编译库：
 
 ```
-third_party/xquic/build-android-arm64/libxquic-static.a
-third_party/xquic/third_party/boringssl/build-android-arm64/libssl.a
-third_party/xquic/third_party/boringssl/build-android-arm64/libcrypto.a
-third_party/nghttp2/build-android-arm64/libnghttp2.a
+sdk/third_party/xquic/build-android-arm64/libxquic-static.a
+sdk/third_party/xquic/third_party/boringssl/build-android-arm64/libssl.a
+sdk/third_party/xquic/third_party/boringssl/build-android-arm64/libcrypto.a
+sdk/third_party/nghttp2/build-android-arm64/libnghttp2.a
 ```
 
 ## ABI 兼容性
@@ -119,14 +130,22 @@ third_party/nghttp2/build-android-arm64/libnghttp2.a
 ## 目录结构
 
 ```text
-include/asternet/       公共 C ABI 头文件
-src/                    C++ 核心：Client、引擎、协议选择器、平台适配
-android/                Android JNI bridge
-demo-app/               Android Network Lab Demo
-tests/                  C++ 单元测试和端到端测试
-server/                 测试用三协议服务器（Go, quic-go）
-docs/                   ABI 设计、架构、POC 文档
-third_party/            nghttp2 / xquic / BoringSSL（预编译库 + 头文件）
+sdk/                    ====== SDK ======
+├── cxx/                C++ 核心库 → libasternet.so
+│   └── public/asternet/ 公共 C ABI 头文件
+├── android/            Android JNI 桥 → libasternet-jni.so + AAR
+├── ios/                iOS SDK（占位）
+├── harmonyos/          鸿蒙 SDK（占位）
+└── third_party/        三方库独立构建（nghttp2/xquic/boringssl）
+
+examples/               ====== 示例 & 测试 ======
+├── android/            Android Demo App（预设场景 + 自定义请求）
+├── cxx/                C++ 单元测试
+├── server/             Go 测试服务器（HTTP/1.1 + HTTP/2 + HTTP/3）
+└── ios/                iOS Example（占位）
+
+scripts/                构建 & 发布脚本
+docs/                   设计文档
 ```
 
 ## 架构
