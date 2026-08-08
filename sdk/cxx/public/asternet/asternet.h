@@ -91,6 +91,7 @@ typedef struct {
     asternet_protocol_policy_t protocol_policy;
     int timeout_ms;
     int idempotent;
+    int allow_insecure_tls_for_testing;
 } asternet_request_t;
 
 typedef struct {

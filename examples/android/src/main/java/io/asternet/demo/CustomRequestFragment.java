@@ -13,6 +13,8 @@ import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.fragment.app.Fragment;
 
+import com.google.android.material.materialswitch.MaterialSwitch;
+
 import com.google.android.material.card.MaterialCardView;
 import com.google.android.material.chip.Chip;
 import com.google.android.material.chip.ChipGroup;
@@ -38,6 +40,7 @@ public final class CustomRequestFragment extends Fragment {
     private TextInputEditText bodyInput;
     private MaterialCardView bodyCard;
     private TextInputEditText timeoutInput;
+    private MaterialSwitch insecureSwitch;
     private Button sendButton;
     private ProgressBar progressBar;
     private TextView resultView;
@@ -58,6 +61,7 @@ public final class CustomRequestFragment extends Fragment {
         bodyInput = root.findViewById(R.id.body_input);
         bodyCard = root.findViewById(R.id.body_card);
         timeoutInput = root.findViewById(R.id.timeout_input);
+        insecureSwitch = root.findViewById(R.id.insecure_switch);
         sendButton = root.findViewById(R.id.send_button);
         progressBar = root.findViewById(R.id.progress_bar);
         resultView = root.findViewById(R.id.result_view);
@@ -98,6 +102,7 @@ public final class CustomRequestFragment extends Fragment {
         final String headersText = headersInput.getText() != null ? headersInput.getText().toString() : "";
         final String bodyText = bodyInput.getText() != null ? bodyInput.getText().toString() : "";
         final byte[] body = bodyText.getBytes(StandardCharsets.UTF_8);
+        final boolean allowInsecure = insecureSwitch != null && insecureSwitch.isChecked();
 
         final String displayUrl = "https://" + host + (port != 443 ? ":" + port : "") + path;
 
@@ -118,7 +123,8 @@ public final class CustomRequestFragment extends Fragment {
                     if (destroyed.get() || client == null) return;
                     response = client.request(host, port, method, path, policy,
                         headersText, body, timeoutMs,
-                        "GET".equals(method) || "HEAD".equals(method) || "OPTIONS".equals(method));
+                        "GET".equals(method) || "HEAD".equals(method) || "OPTIONS".equals(method),
+                        allowInsecure);
                 }
             } catch (Exception e) {
                 Log.e(TAG, "Custom request exception: " + e.getMessage(), e);

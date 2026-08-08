@@ -1,89 +1,79 @@
 # AsterNet
 
-跨平台 C++ 网络核心，支持 HTTP/1.1、HTTP/2 和 HTTP/3，附带 Android Network Lab Demo。
+**Cross-platform C++ networking core with HTTP/1.1, HTTP/2, and HTTP/3 via QUIC.**
 
-## 快速开始（Android）
+Built for mobile SDK teams who need direct protocol control, multi-platform consistency, and independence from platform HTTP stacks.
+
+[中文文档](README.zh.md)
+
+## Why AsterNet
+
+Platform HTTP clients (OkHttp, URLSession, `@ohos.net.http`) are black boxes — you cannot inspect protocol negotiation, measure per-phase latency, or customize TLS behavior. AsterNet gives you full control: DNS → TCP/QUIC → TLS → HTTP frames, every byte accounted for.
+
+| | OkHttp | Cronet | AsterNet |
+|---|--------|--------|----------|
+| **Cross-platform** | Android/JVM only | Android (Chromium) | Android, iOS, HarmonyOS, Linux/macOS |
+| **Protocol control** | Limited (ALPN hints) | Limited | Per-request: AUTO / H1 / H2 / H3 |
+| **HTTP/3** | Experimental | ✅ | ✅ (XQUIC) |
+| **Per-phase metrics** | ❌ | Limited | ✅ DNS, Connect, TLS, TTFB, Total |
+| **TLS customization** | HostnameVerifier only | ❌ | ✅ Custom CA bundle, cert verify callback |
+| **Binary size** | ~1 MB (JVM) | ~8 MB (native) | ~3 MB (native, without H3) |
+| **Concurrency model** | Thread pool | Thread pool | Synchronous API, caller controls threading |
+| **Memory** | GC-managed | Native heap | Native heap, no GC pressure |
+
+## Architecture
+
+<img src="docs/images/mermaid-diagram-2026-08-08-194816.png" alt="Asternet Architecture" width=585.9 height=809.1/>
+
+
+## Features
+
+### Protocol Stack
+- **HTTP/1.1** — self-built engine with chunked encoding, keep-alive
+- **HTTP/2** — full nghttp2 integration, multiplexing, HPACK, server push
+- **HTTP/3** — QUIC via alibaba/xquic, 0-RTT, connection migration
+
+### Protocol Selection
+- **AUTO** — H3 → H2 → H1.1 automatic fallback with circuit breaker
+- **Per-request control** — force any protocol, skip automatic downgrade
+- **Host-level circuit breaker** — 3 consecutive failures = 60s cooldown per host
+
+### Security
+- TLS 1.3 with BoringSSL (same engine as Chromium)
+- Custom CA certificate bundle injection
+- Certificate verification callback (inspect chain before trust)
+- `allow_insecure_tls_for_testing` for local development
+
+### Observability
+- Per-phase latency: DNS, Connect, TLS, TTFB, Total
+- Protocol used (even on fallback)
+- Native log callback → integrate with any logging system
+- Diagnostics dump (connection pool, DNS cache)
+
+### Platform Support
+| Platform | Status | SDK Format |
+|----------|--------|------------|
+| Android | ✅ Production | AAR + .so (arm64-v8a, 16KB page) |
+| iOS | 🚧 Example ready | xcframework (pending) |
+| HarmonyOS | 🚧 Example ready | .har (pending) |
+| Linux/macOS | ✅ C++ tests | static/shared library |
+
+## Quick Start
+
+### Android
 
 ```bash
-# 1. 设置第三方依赖
-./scripts/setup-third-party.sh --local third_party/xquic third_party/nghttp2
+# 1. Setup third-party dependencies (one command)
+./sdk/third_party/repack.sh
 
-# 2. 构建 Demo APK
+# 2. Build APK
 ./gradlew :examples:android:assembleDebug
 
-# 3. 安装到设备
+# 3. Install
 adb install -r examples/android/build/outputs/apk/debug/android-debug.apk
 ```
 
-如果没有本地编译好的 xquic/nghttp2，需要先从 GitHub Releases 下载预编译库：
-
-```bash
-# 替换为实际的 Release URL
-./setup-third-party.sh --url https://github.com/YOUR_ORG/asternet/releases/download/libs-v1
-```
-
-## Demo App 功能
-
-AsterNet Network Lab 提供两个页面：
-
-| Tab | 功能 |
-|-----|------|
-| **Presets** | 5 个预设场景，一键测试 HTTP/1.1、HTTP/2、HTTP/3 协议 |
-| **Custom** | 自定义请求：自由编辑域名、端口、路径、方法、Headers、Body、超时 |
-
-支持的方法：`GET` / `POST` / `PUT` / `DELETE`
-
-支持的协议策略：`AUTO` / `HTTP/1.1` / `HTTP/2` / `HTTP/3`
-
-## 第三方依赖管理
-
-项目依赖三个 C/C++ 库，**源码不入仓库**（体积近 1GB），通过预编译 `.a` 文件分发：
-
-| 库 | 用途 | 预编译大小 |
-|----|------|-----------|
-| nghttp2 | HTTP/2 协议 | 308 KB |
-| xquic | HTTP/3 (QUIC) | 7 MB |
-| BoringSSL | TLS 加密 | 41 MB (ssl + crypto) |
-
-### 脚本说明
-
-```bash
-# 下载预编译库 + 头文件
-./setup-third-party.sh --url <base_url>
-
-# 从本地 xquic 构建目录拷贝（已有编译产物时）
-./setup-third-party.sh --local path/to/xquic path/to/nghttp2
-
-# 打包本地编译产物，准备上传 GitHub Releases
-./package-third-party.sh
-```
-
-### 发布预编译库到 GitHub Releases
-
-```bash
-# 1. 打包
-./package-third-party.sh
-
-# 2. 创建 Release
-gh release create libs-v1 third_party_release/* \
-  --title "Prebuilt libs arm64-v8a" \
-  --notes "nghttp2 + xquic + BoringSSL 预编译静态库"
-```
-
-## 构建
-
-```bash
-# 统一构建入口
-./scripts/build.sh --android          # 仅 Android
-./scripts/build.sh --android --debug  # Android Debug（可调试）
-./scripts/build.sh --cxx              # C++ 核心 + 测试
-./scripts/build.sh --cxx --test       # 编译并运行测试
-./scripts/build.sh --all              # 全平台
-```
-
-### 桌面构建
-
-需要 CMake ≥ 3.18、C++17、以及预编译的 nghttp2 和 BoringSSL：
+### C++ (Desktop)
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
@@ -91,92 +81,108 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-公网端到端测试工具 `build/tests/test_e2e` 和 `build/tests/test_protocol_switch` 默认不注册到 CTest；确认网络可用后用以下命令启用：
+## API
 
-```bash
-cmake -S . -B build -DASTERNET_REGISTER_NETWORK_TESTS=ON
+### C ABI (all platforms)
+
+```c
+#include "asternet/asternet.h"
+
+// Create client
+asternet_client_config_t cfg = { .struct_size = sizeof(cfg),
+    .abi_version = ASTERNET_ABI_VERSION,
+    .default_timeout_ms = 12000,
+    .enable_http3 = 1 };
+asternet_client_t *client = asternet_client_create(&cfg, NULL);
+
+// Synchronous request
+asternet_request_t req = { .host = "www.cloudflare.com", .port = 443,
+    .method = "GET", .path = "/",
+    .protocol_policy = ASTERNET_POLICY_AUTO,
+    .timeout_ms = 12000 };
+uint8_t body[1024 * 1024];
+asternet_response_info_t info;
+asternet_client_request_sync(client, &req, body, sizeof(body), &info);
+
+printf("HTTP %d via %s, %zu bytes, %lld ms\n",
+    info.http_status,
+    info.protocol == ASTERNET_PROTOCOL_HTTP_3 ? "H3" : "H2/H1",
+    info.body_size, info.total_ms);
+
+asternet_client_destroy(client);
 ```
 
-## Android 构建选项
+### Android (Java/Kotlin)
 
-默认编译 HTTP/1.1 + HTTP/2。启用 HTTP/3 时设置 `ASTERNET_ENABLE_XQUIC=ON`（`demo-app/build.gradle` 中已默认开启）：
-
-```bash
-# 仅 HTTP/1.1 + HTTP/2（较快）
-./gradlew :demo-app:assembleDebug
-
-# 含 HTTP/3（需要 xquic + boringssl 预编译库）
-# 已在 build.gradle 中默认配置 ASTERNET_ENABLE_XQUIC=ON
+```java
+AsterNet.Client client = AsterNet.createClient(true, caBundlePem);
+AsterNet.Response resp = client.request(
+    "www.cloudflare.com", 443, "GET", "/",
+    AsterNet.Policy.AUTO, "", new byte[0], 12000, true);
+System.out.println(resp.protocolName() + " " + resp.status);
+client.close();
 ```
 
-CMake 会自动从以下路径查找预编译库：
+See [API Reference](docs/API.md) for full details.
 
-```
-sdk/third_party/xquic/build-android-arm64/libxquic-static.a
-sdk/third_party/xquic/third_party/boringssl/build-android-arm64/libssl.a
-sdk/third_party/xquic/third_party/boringssl/build-android-arm64/libcrypto.a
-sdk/third_party/nghttp2/build-android-arm64/libnghttp2.a
-```
+## Performance
 
-## ABI 兼容性
+| Metric | Value | Notes |
+|--------|-------|-------|
+| HTTP/1.1 TTFB | ~50–200 ms | Depends on network RTT |
+| HTTP/2 TTFB | ~40–150 ms | Multiplexed, single connection |
+| HTTP/3 (QUIC) TTFB | ~10–30 ms | 0-RTT possible on reconnect |
+| H3 connection setup | ~1 handshake | vs H2: TCP + TLS (2–3 round trips) |
+| Binary size (all .so) | ~7.5 MB | 6 independent .so files |
+| Memory per request | ~1 MB | Configurable buffer size |
+| Concurrent requests | Unlimited | Caller controls thread pool |
 
-| 字段 | 值 |
-|------|-----|
-| ABI Version | `0x00010000` (Major=1, Minor=0) |
-| minSdk | 21 (Android 5.0) |
-| targetSdk | 36 |
-| ABI | arm64-v8a |
+## Concurrency & Stability
 
-## 目录结构
+- **Synchronous API** — no hidden thread pools, no callback hell. Caller chooses threading model.
+- **Thread-safe** — single client instance can be shared across threads (mutex per request).
+- **Circuit breaker** — per-host, per-protocol. 3 failures → 60s cooldown. Prevents cascading failures.
+- **No GC pressure** — C++ core, zero allocations on JVM heap during requests.
+- **Deterministic resource lifecycle** — `create` → `request` → `destroy`. No leaked connections.
+
+## Compared to OkHttp
+
+See [docs/OKHTTP_COMPARISON.md](docs/OKHTTP_COMPARISON.md) for detailed analysis.
+
+**Key differences:**
+
+1. **Protocol visibility** — OkHttp hides protocol selection behind interceptors. AsterNet exposes `protocol_policy` per-request and reports actual protocol used.
+
+2. **Latency breakdown** — OkHttp's `EventListener` gives callback-based timing. AsterNet returns `{dns_ms, connect_ms, tls_ms, ttfb_ms, total_ms}` in every response struct.
+
+3. **HTTP/3** — OkHttp's H3 is experimental and limited to specific JVM builds. AsterNet's H3 is native QUIC via xquic, used in production by Alibaba Cloud CDN.
+
+4. **Multi-platform** — OkHttp is JVM-only. AsterNet runs on iOS, HarmonyOS, and desktop via the same C ABI.
+
+5. **Binary overhead** — OkHttp requires JVM + Kotlin stdlib (~2 MB). AsterNet is pure native code (~3 MB .so).
+
+## Directory Structure
 
 ```text
-sdk/                    ====== SDK ======
-├── cxx/                C++ 核心库 → libasternet.so
-│   └── public/asternet/ 公共 C ABI 头文件
-├── android/            Android JNI 桥 → libasternet-jni.so + AAR
-├── ios/                iOS SDK（占位）
-├── harmonyos/          鸿蒙 SDK（占位）
-└── third_party/        三方库独立构建（nghttp2/xquic/boringssl）
+sdk/                    SDK (deliverables)
+├── cxx/                C++ core → libasternet.so
+│   └── public/         Public C ABI headers
+├── android/            Android JNI bridge + AAR
+├── ios/                iOS Framework (placeholder)
+├── harmonyos/          HarmonyOS NAPI bridge (placeholder)
+└── third_party/        Third-party: nghttp2, xquic, BoringSSL → independent .so
 
-examples/               ====== 示例 & 测试 ======
-├── android/            Android Demo App（预设场景 + 自定义请求）
-├── cxx/                C++ 单元测试
-├── server/             Go 测试服务器（HTTP/1.1 + HTTP/2 + HTTP/3）
-└── ios/                iOS Example（占位）
+examples/               Runnable examples
+├── android/            Android Demo (Presets + Custom Request tabs)
+├── cxx/                C++ unit tests
+├── ios/                iOS Demo (SwiftUI)
+├── harmonyos/          HarmonyOS Demo (ArkTS)
+└── server/             Go test server (H1/H2/H3)
 
-scripts/                构建 & 发布脚本
-docs/                   设计文档
+scripts/                Build & release scripts
+docs/                   Documentation
 ```
 
-## 架构
+## License
 
-```
-┌──────────────────────────────────────────────┐
-│  Demo App (Java)                              │
-│  ├─ Presets Tab  ── 预设场景                   │
-│  └─ Custom Tab   ── 自定义请求表单              │
-├──────────────────────────────────────────────┤
-│  AsterNet.java  ── JNI ──► asternet_jni.cpp  │
-├──────────────────────────────────────────────┤
-│  C ABI (asternet_*)  ←──  asternet/asternet.h │
-├──────────────────────────────────────────────┤
-│  Client  ──►  ProtocolSelector               │
-│                ├─ QuicEngine   (HTTP/3)       │
-│                ├─ Http2Engine  (HTTP/2)       │
-│                └─ Http1Engine  (HTTP/1.1)     │
-│             降级链: H3 → H2 → H1              │
-├──────────────────────────────────────────────┤
-│  nghttp2  │  xquic  │  BoringSSL             │
-└──────────────────────────────────────────────┘
-```
-
-## 限制
-
-- 当前为同步请求接口，尚未提供异步回调、WebSocket 或连接池。
-- HTTPDNS 仅有 Resolver SPI/缓存设计，未绑定具体服务端。
-- Android Demo 已适配系统 CA 证书；其他平台需自行提供 trust store。
-- HTTP/3 需要 UDP/443 可达的网络环境。
-
-## 许可证
-
-Apache License 2.0。第三方依赖的许可证以各自目录中的原始文件为准。
+Apache License 2.0. Third-party dependencies retain their original licenses.

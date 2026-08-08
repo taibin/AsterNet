@@ -67,8 +67,14 @@ public final class AsterNet {
         public synchronized Response request(String host, int port, String method, String path,
                                               int policy, String headers, byte[] body, int timeoutMs,
                                               boolean idempotent) {
+            return request(host, port, method, path, policy, headers, body, timeoutMs, idempotent, false);
+        }
+
+        public synchronized Response request(String host, int port, String method, String path,
+                                              int policy, String headers, byte[] body, int timeoutMs,
+                                              boolean idempotent, boolean allowInsecure) {
             return requestNative(handle, host, port, method, path, policy, headers, body,
-                timeoutMs, idempotent);
+                timeoutMs, idempotent, allowInsecure);
         }
 
         @Override
@@ -90,22 +96,28 @@ public final class AsterNet {
 
     public static native String nativeVersion();
     private static native long nativeCreateClient(int abiVersion, boolean enableH3,
-                                                   String caCertPem);
+                                                   boolean allowInsecure, String caCertPem);
     private static native void nativeDestroyClient(long handle);
     private static native String nativeRequest(long handle, String host, int port, String method,
                                                String path, int policy, String headers, byte[] body,
-                                               int timeoutMs, boolean idempotent);
+                                               int timeoutMs, boolean idempotent,
+                                               boolean allowInsecure);
 
     public static Client createClient(boolean enableH3, String caCertPem) {
-        return new Client(nativeCreateClient(ABI_VERSION, enableH3, caCertPem));
+        return createClient(enableH3, false, caCertPem);
+    }
+
+    public static Client createClient(boolean enableH3, boolean allowInsecure, String caCertPem) {
+        return new Client(nativeCreateClient(ABI_VERSION, enableH3, allowInsecure, caCertPem));
     }
 
     private static Response requestNative(long handle, String host, int port, String method,
                                           String path, int policy, String headers, byte[] body,
-                                          int timeoutMs, boolean idempotent) {
+                                          int timeoutMs, boolean idempotent,
+                                          boolean allowInsecure) {
         try {
             return new Response(new JSONObject(nativeRequest(handle, host, port, method, path,
-                policy, headers, body, timeoutMs, idempotent)));
+                policy, headers, body, timeoutMs, idempotent, allowInsecure)));
         } catch (Exception error) {
             try {
                 return new Response(new JSONObject("{\"result\":-100,\"error\":\""

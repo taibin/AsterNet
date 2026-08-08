@@ -261,7 +261,8 @@ ASTERNET_API asternet_result_t asternet_client_request_sync(
                                                       request->timeout_ms);
     internal_request.idempotent = request->idempotent != 0 || is_idempotent_method(request->method);
     internal_request.allow_insecure_tls_for_testing =
-        internal_client->config().allow_insecure_tls_for_testing != 0;
+        internal_client->config().allow_insecure_tls_for_testing != 0
+        || request->allow_insecure_tls_for_testing != 0;
     internal_request.ca_cert_pem = internal_client->ca_cert_pem();
     const int configured_max_body = internal_client->config().max_response_body_bytes;
     if (configured_max_body > 0) {
@@ -287,7 +288,10 @@ ASTERNET_API asternet_result_t asternet_client_request_sync(
     bool degraded = false;
     const int request_result = internal_client->request_with_policy(
         internal_request, request->protocol_policy, response, &actual_protocol, &degraded);
-    response.protocol = actual_protocol;
+    // 仅在成功时覆盖协议（失败时保留引擎设置的协议，便于日志/调试）
+    if (request_result == ASTERNET_OK) {
+        response.protocol = actual_protocol;
+    }
     response.degraded = degraded;
     const asternet_result_t result = static_cast<asternet_result_t>(request_result);
     fill_response_info(response, result, out_info);

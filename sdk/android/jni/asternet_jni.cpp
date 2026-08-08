@@ -96,7 +96,8 @@ Java_io_asternet_AsterNet_nativeVersion(JNIEnv *env, jclass /*clazz*/) {
 
 JNIEXPORT jlong JNICALL
 Java_io_asternet_AsterNet_nativeCreateClient(JNIEnv *env, jclass /*clazz*/, jint abi_version,
-                                              jboolean enable_h3, jstring jca_cert_pem) {
+                                              jboolean enable_h3, jboolean allow_insecure,
+                                              jstring jca_cert_pem) {
     UtfChars ca_cert_pem(env, jca_cert_pem);
     asternet_client_config_t config{};
     config.struct_size = sizeof(config);
@@ -104,7 +105,7 @@ Java_io_asternet_AsterNet_nativeCreateClient(JNIEnv *env, jclass /*clazz*/, jint
     config.default_timeout_ms = 12000;
     config.max_response_body_bytes = 4 * 1024 * 1024;  // 4 MB
     config.enable_http3 = enable_h3 ? 1 : 0;
-    config.allow_insecure_tls_for_testing = 0;
+    config.allow_insecure_tls_for_testing = allow_insecure ? 1 : 0;
     config.ca_cert_pem = ca_cert_pem.get();
     asternet_result_t error = ASTERNET_OK;
     asternet_client_t *client = asternet_client_create(&config, &error);
@@ -120,7 +121,8 @@ JNIEXPORT jstring JNICALL
 Java_io_asternet_AsterNet_nativeRequest(JNIEnv *env, jclass /*clazz*/, jlong handle,
                                          jstring jhost, jint port, jstring jmethod, jstring jpath,
                                          jint policy, jstring jheaders, jbyteArray jbody,
-                                         jint timeout_ms, jboolean idempotent) {
+                                         jint timeout_ms, jboolean idempotent,
+                                         jboolean allow_insecure) {
     UtfChars host(env, jhost);
     UtfChars method(env, jmethod);
     UtfChars path(env, jpath);
@@ -182,6 +184,7 @@ Java_io_asternet_AsterNet_nativeRequest(JNIEnv *env, jclass /*clazz*/, jlong han
     request.protocol_policy = static_cast<asternet_protocol_policy_t>(policy);
     request.timeout_ms = timeout_ms;
     request.idempotent = idempotent ? 1 : 0;
+    request.allow_insecure_tls_for_testing = allow_insecure ? 1 : 0;
 
     std::vector<uint8_t> response_body(4 * 1024 * 1024);  // 4 MB 缓冲区
     asternet_response_info_t response{};
