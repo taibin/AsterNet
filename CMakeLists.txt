@@ -41,6 +41,8 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release" AND ASTERNET_ENABLE_LTO)
     endif()
 endif()
 
+include(GNUInstallDirs)
+
 # ---- 辅助模块 ----
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
@@ -63,5 +65,4 @@ if(ASTERNET_BUILD_IOS)
 endif()
 
 # ---- 安装 ----
-include(GNUInstallDirs)
 install(DIRECTORY sdk/cxx/public/asternet DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/asternet)

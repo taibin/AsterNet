@@ -17,6 +17,12 @@ set(ASTERNET_SOURCES
     ${SDK_CXX}/platform/event_loop.cpp
     ${SDK_CXX}/platform/log.cpp
     ${SDK_CXX}/platform/tls.cpp
+    ${SDK_CXX}/connection/connection_pool.cpp
+    ${SDK_CXX}/dns/dns_resolver.cpp
+    ${SDK_CXX}/sdt/quality_prober.cpp
+    ${SDK_CXX}/orchestrator/interceptor.cpp
+    ${SDK_CXX}/monitor/metrics.cpp
+    ${SDK_CXX}/protocol/protocol.cpp
     ${SDK_CXX}/engine/http1_engine.cpp
     ${SDK_CXX}/engine/http2_engine.cpp
     ${SDK_CXX}/engine/protocol_selector.cpp

@@ -18,6 +18,7 @@
 #include <openssl/ssl.h>
 
 #include <cstdio>
+#include <chrono>
 
 #include "platform/log.h"
 #include "platform/tls.h"
@@ -29,6 +30,26 @@ namespace asternet {
 namespace engine {
 
 namespace {
+
+int64_t monotonic_ms() {
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    return std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+}
+
+int select_with_deadline(int fd, bool want_read, bool want_write, int64_t deadline_ms) {
+    const int64_t remaining_ms = deadline_ms - monotonic_ms();
+    if (remaining_ms <= 0) return 0;
+    fd_set rfds;
+    fd_set wfds;
+    FD_ZERO(&rfds);
+    FD_ZERO(&wfds);
+    if (want_read) FD_SET(fd, &rfds);
+    if (want_write) FD_SET(fd, &wfds);
+    struct timeval tv{static_cast<time_t>(remaining_ms / 1000),
+                      static_cast<suseconds_t>((remaining_ms % 1000) * 1000)};
+    return select(fd + 1, want_read ? &rfds : nullptr, want_write ? &wfds : nullptr,
+                  nullptr, &tv);
+}
 
 // 单请求上下文（传递给 nghttp2 回调）
 struct H2Ctx {
@@ -42,10 +63,13 @@ struct H2Ctx {
     int http_status = 0;
     bool got_status = false;
     bool stream_closed = false;
+    bool got_end_stream = false;
     int32_t stream_id = 0;
     uint32_t stream_error = NGHTTP2_NO_ERROR;
+    size_t response_header_bytes = 0;
     size_t max_response_body_bytes = 16 * 1024 * 1024;
     bool body_limit_exceeded = false;
+    int64_t deadline_ms = 0;
 };
 
 // nghttp2 发送回调：把 nghttp2 编码的数据经 TLS 写出。
@@ -61,7 +85,7 @@ static ssize_t send_callback(nghttp2_session * /*session*/, const uint8_t *data,
     int fd = SSL_get_fd(ssl);
     size_t sent = 0;
 
-    ASTER_LOG_INFO("asternet-h2", "  send_cb ENTER length=%zu ssl=%p fd=%d",
+    ASTER_LOG_DEBUG("asternet-h2", "  send_cb ENTER length=%zu ssl=%p fd=%d",
                length, (void*)ssl, fd);
 
     while (sent < length) {
@@ -69,21 +93,17 @@ static ssize_t send_callback(nghttp2_session * /*session*/, const uint8_t *data,
         if (n > 0) { sent += n; continue; }
 
         int err = SSL_get_error(ssl, n);
-        ASTER_LOG_INFO("asternet-h2", "  send_cb SSL_write=%d err=%d sent=%zu/%zu",
+        ASTER_LOG_DEBUG("asternet-h2", "  send_cb SSL_write=%d err=%d sent=%zu/%zu",
                    n, err, sent, length);
         if (err == SSL_ERROR_WANT_WRITE) {
-            fd_set wfds; FD_ZERO(&wfds); FD_SET(fd, &wfds);
-            struct timeval tv{5, 0};
-            if (select(fd + 1, nullptr, &wfds, nullptr, &tv) <= 0)
+            if (select_with_deadline(fd, false, true, ctx->deadline_ms) <= 0)
                 return NGHTTP2_ERR_CALLBACK_FAILURE;
             continue;
         }
         if (err == SSL_ERROR_WANT_READ) {
             // TLS post-handshake：server 在 client 发 preface 前先发了
             // NewSessionTicket 等消息，SSL 必须先读才能继续写。
-            fd_set rfds; FD_ZERO(&rfds); FD_SET(fd, &rfds);
-            struct timeval tv{5, 0};
-            if (select(fd + 1, &rfds, nullptr, nullptr, &tv) <= 0)
+            if (select_with_deadline(fd, true, false, ctx->deadline_ms) <= 0)
                 return NGHTTP2_ERR_CALLBACK_FAILURE;
             for (;;) {
                 uint8_t drain[4096];
@@ -94,16 +114,7 @@ static ssize_t send_callback(nghttp2_session * /*session*/, const uint8_t *data,
                 }
                 int read_err = SSL_get_error(ssl, read);
                 if (read_err == SSL_ERROR_WANT_READ || read_err == SSL_ERROR_WANT_WRITE) {
-                    fd_set fds;
-                    FD_ZERO(&fds);
-                    FD_SET(fd, &fds);
-                    struct timeval retry_tv{5, 0};
-                    if (select(fd + 1, read_err == SSL_ERROR_WANT_READ ? &fds : nullptr,
-                               read_err == SSL_ERROR_WANT_WRITE ? &fds : nullptr,
-                               nullptr, &retry_tv) <= 0) {
-                        return NGHTTP2_ERR_CALLBACK_FAILURE;
-                    }
-                    continue;
+                    break;
                 }
                 return NGHTTP2_ERR_CALLBACK_FAILURE;
             }
@@ -111,7 +122,7 @@ static ssize_t send_callback(nghttp2_session * /*session*/, const uint8_t *data,
         }
         return NGHTTP2_ERR_CALLBACK_FAILURE;
     }
-    ASTER_LOG_INFO("asternet-h2", "  send_cb EXIT sent=%zu", sent);
+    ASTER_LOG_DEBUG("asternet-h2", "  send_cb EXIT sent=%zu", sent);
     return (ssize_t)sent;
 }
 
@@ -140,6 +151,8 @@ static int on_header_callback(nghttp2_session * /*session*/, const nghttp2_frame
                               uint8_t /*flags*/, void *user_data) {
     auto *ctx = static_cast<H2Ctx *>(user_data);
     if (frame->hd.stream_id != ctx->stream_id) return 0;
+    ctx->response_header_bytes += namelen + valuelen;
+    if (ctx->response_header_bytes > 64 * 1024) return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
     if (frame->hd.type == NGHTTP2_HEADERS && frame->headers.cat == NGHTTP2_HCAT_RESPONSE) {
         if (namelen == 7 && memcmp(name, ":status", 7) == 0) {
             char sbuf[8];
@@ -170,7 +183,7 @@ static int on_data_chunk_recv_callback(nghttp2_session * /*session*/, uint8_t /*
 
 // stream 关闭回调
 static int on_stream_close_callback(nghttp2_session * /*session*/, int32_t stream_id,
-                                    uint32_t error_code, void *user_data) {
+                                     uint32_t error_code, void *user_data) {
     auto *ctx = static_cast<H2Ctx *>(user_data);
     if (stream_id != ctx->stream_id) return 0;
     ctx->stream_error = error_code;
@@ -178,10 +191,25 @@ static int on_stream_close_callback(nghttp2_session * /*session*/, int32_t strea
     return 0;
 }
 
-int connect_tcp(const char *host, uint16_t port, int timeout_ms) {
+static int on_frame_recv_callback(nghttp2_session * /*session*/, const nghttp2_frame *frame,
+                                  void *user_data) {
+    auto *ctx = static_cast<H2Ctx *>(user_data);
+    if (frame->hd.stream_id != ctx->stream_id) return 0;
+    const bool response_body_end = frame->hd.type == NGHTTP2_DATA
+        || frame->hd.type == NGHTTP2_HEADERS;
+    if (response_body_end && (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0) {
+        ctx->got_end_stream = true;
+        ctx->stream_error = NGHTTP2_NO_ERROR;
+        ctx->stream_closed = true;
+    }
+    return 0;
+}
+
+int connect_tcp(const char *host, uint16_t port, int64_t deadline_ms) {
     struct addrinfo hints{}, *res = nullptr;
     hints.ai_family = AF_UNSPEC;  // 同时支持 IPv4/IPv6，兼容纯 IPv6+NAT64 网络
     hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_NUMERICHOST;
     char port_str[8];
     snprintf(port_str, sizeof(port_str), "%u", port);
     if (getaddrinfo(host, port_str, &hints, &res) != 0 || res == nullptr) return -1;
@@ -209,11 +237,7 @@ int connect_tcp(const char *host, uint16_t port, int timeout_ms) {
         if (cr == 0) break;
         if (errno == EINPROGRESS) {
             // 非阻塞 connect：等 socket 可写确认连接完成
-            fd_set wfds;
-            FD_ZERO(&wfds);
-            FD_SET(fd, &wfds);
-            struct timeval ct{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
-            if (select(fd + 1, nullptr, &wfds, nullptr, &ct) > 0) {
+            if (select_with_deadline(fd, false, true, deadline_ms) > 0) {
                 int err = 0;
                 socklen_t len = sizeof(err);
                 getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);
@@ -230,21 +254,34 @@ int connect_tcp(const char *host, uint16_t port, int timeout_ms) {
 }  // namespace
 
 int Http2Engine::request(const Request &req, Response &resp) {
+    resp = Response{};
     resp.protocol = ASTERNET_PROTOCOL_HTTP_2;
-    ASTER_LOG_INFO("asternet-h2", "==> %s:%d %s %s timeout_ms=%d",
-               req.host.c_str(), req.port, req.method.c_str(), req.path.c_str(), req.timeout_ms);
-    struct timespec t_start;
-    clock_gettime(CLOCK_MONOTONIC, &t_start);
+    resp.dns_ms = req.dns_ms;
+    ASTER_LOG_INFO("asternet-h2", "==> %s:%d %s timeout_ms=%d",
+               req.host.c_str(), req.port, req.method.c_str(), req.timeout_ms);
+    const int64_t t_start = monotonic_ms();
+    const int64_t deadline_ms = t_start + req.timeout_ms;
 
     // 1. TCP connect
-    int fd = connect_tcp(req.host.c_str(), req.port, req.timeout_ms);
-    if (fd < 0) { resp.err_code = ASTERNET_ERR_CONNECT; return ASTERNET_ERR_CONNECT; }
+    const char *endpoint = req.connect_host.empty() ? req.host.c_str() : req.connect_host.c_str();
+    const int64_t connect_start = monotonic_ms();
+    int fd = connect_tcp(endpoint, req.port, deadline_ms);
+    resp.connect_ms = monotonic_ms() - connect_start;
+    if (fd < 0) {
+        resp.err_code = ASTERNET_ERR_CONNECT;
+        resp.failure_stage = "connect";
+        resp.total_ms = monotonic_ms() - t_start;
+        return ASTERNET_ERR_CONNECT;
+    }
 
     // 2. TLS + ALPN h2
     SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
     if (!ctx) { close(fd); resp.err_code = ASTERNET_ERR_TLS; return ASTERNET_ERR_TLS; }
-    const bool allow_insecure = allow_insecure_tls_for_testing_
-                             || req.allow_insecure_tls_for_testing;
+#ifdef ASTERNET_ALLOW_INSECURE_TLS_FOR_TESTING
+    const bool allow_insecure = allow_insecure_tls_for_testing_;
+#else
+    const bool allow_insecure = false;
+#endif
     SSL_CTX_set_verify(ctx, allow_insecure ? SSL_VERIFY_NONE : SSL_VERIFY_PEER, nullptr);
     const std::string &ca_bundle = req.ca_cert_pem.empty() ? ca_cert_pem_ : req.ca_cert_pem;
     const bool trust_ready = allow_insecure
@@ -285,28 +322,33 @@ int Http2Engine::request(const Request &req, Response &resp) {
         return ASTERNET_ERR_TLS;
     }
     // 非阻塞 socket 下 SSL_connect 可能需多次重试
+    const int64_t tls_start = monotonic_ms();
     int ssl_ret;
     while ((ssl_ret = SSL_connect(ssl)) != 1) {
         int ssl_err = SSL_get_error(ssl, ssl_ret);
         if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
-            fd_set fds;
-            FD_ZERO(&fds);
-            FD_SET(fd, &fds);
-            struct timeval tv{3, 0};
-            int selected = select(fd + 1, ssl_err == SSL_ERROR_WANT_READ ? &fds : nullptr,
-                                  ssl_err == SSL_ERROR_WANT_WRITE ? &fds : nullptr, nullptr, &tv);
+            int selected = select_with_deadline(fd, ssl_err == SSL_ERROR_WANT_READ,
+                                                ssl_err == SSL_ERROR_WANT_WRITE, deadline_ms);
             if (selected <= 0) {
                 SSL_free(ssl);
                 SSL_CTX_free(ctx);
                 close(fd);
                 resp.err_code = selected == 0 ? ASTERNET_ERR_TIMEOUT : ASTERNET_ERR_TLS;
+                resp.tls_ms = monotonic_ms() - tls_start;
+                resp.failure_stage = resp.err_code == ASTERNET_ERR_TIMEOUT ? "tls" : "tls";
+                resp.total_ms = monotonic_ms() - t_start;
                 return resp.err_code;
             }
             continue;
         }
         SSL_free(ssl); SSL_CTX_free(ctx); close(fd);
-        resp.err_code = ASTERNET_ERR_TLS; return ASTERNET_ERR_TLS;
+        resp.err_code = ASTERNET_ERR_TLS;
+        resp.tls_ms = monotonic_ms() - tls_start;
+        resp.failure_stage = "tls";
+        resp.total_ms = monotonic_ms() - t_start;
+        return ASTERNET_ERR_TLS;
     }
+    resp.tls_ms = monotonic_ms() - tls_start;
     // 校验 ALPN 协商结果
     const unsigned char *alpn = nullptr;
     unsigned int alpn_len = 0;
@@ -326,6 +368,7 @@ int Http2Engine::request(const Request &req, Response &resp) {
     h2ctx.ssl = ssl;
     h2ctx.req_body = req.body;
     h2ctx.max_response_body_bytes = req.max_response_body_bytes;
+    h2ctx.deadline_ms = deadline_ms;
 
     nghttp2_session_callbacks *cbs = nullptr;
     if (nghttp2_session_callbacks_new(&cbs) != 0) {
@@ -338,6 +381,7 @@ int Http2Engine::request(const Request &req, Response &resp) {
     nghttp2_session_callbacks_set_send_callback(cbs, send_callback);
     nghttp2_session_callbacks_set_on_header_callback(cbs, on_header_callback);
     nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbs, on_data_chunk_recv_callback);
+    nghttp2_session_callbacks_set_on_frame_recv_callback(cbs, on_frame_recv_callback);
     nghttp2_session_callbacks_set_on_stream_close_callback(cbs, on_stream_close_callback);
 
     nghttp2_session *session = nullptr;
@@ -397,12 +441,9 @@ int Http2Engine::request(const Request &req, Response &resp) {
     h2ctx.stream_id = stream_id;
 
     // 6. select 驱动收发循环：非阻塞 socket 下发送前需等可写，避免 WOULDBLOCK 丢数据
-    struct timespec t_deadline;
-    clock_gettime(CLOCK_MONOTONIC, &t_deadline);
-    t_deadline.tv_sec += req.timeout_ms / 1000 + 1;
-
     int ret = ASTERNET_OK;
     int iter = 0;
+    bool got_first_byte = false;
     while (!h2ctx.stream_closed) {
         ++iter;
         // -- 发送阶段：无条件调用，send_callback 已内置重试，不会 WOULDBLOCK --
@@ -425,12 +466,12 @@ int Http2Engine::request(const Request &req, Response &resp) {
             fd_set rfds;
             FD_ZERO(&rfds);
             FD_SET(fd, &rfds);
-            struct timeval rtv{1, 0};
+            const int64_t remaining_ms = deadline_ms - monotonic_ms();
+            if (remaining_ms <= 0) { ret = ASTERNET_ERR_TIMEOUT; break; }
+            struct timeval rtv{static_cast<time_t>(remaining_ms / 1000),
+                               static_cast<suseconds_t>((remaining_ms % 1000) * 1000)};
             int sel = select(fd + 1, &rfds, nullptr, nullptr, &rtv);
-
-            struct timespec now;
-            clock_gettime(CLOCK_MONOTONIC, &now);
-            if (now.tv_sec > t_deadline.tv_sec) { ret = ASTERNET_ERR_TIMEOUT; break; }
+            if (monotonic_ms() >= deadline_ms) { ret = ASTERNET_ERR_TIMEOUT; break; }
             if (sel <= 0) continue;
 
             uint8_t rbuf[16384];
@@ -441,18 +482,19 @@ int Http2Engine::request(const Request &req, Response &resp) {
                 int err = SSL_get_error(ssl, n);
                 if (err == SSL_ERROR_WANT_READ) break;
                 if (err == SSL_ERROR_WANT_WRITE) {
-                    fd_set wfds;
-                    FD_ZERO(&wfds);
-                    FD_SET(fd, &wfds);
-                    struct timeval wtv{1, 0};
-                    if (select(fd + 1, nullptr, &wfds, nullptr, &wtv) > 0) continue;
+                    if (select_with_deadline(fd, false, true, deadline_ms) > 0) continue;
+                    ret = ASTERNET_ERR_TIMEOUT;
                     n = -1;
                 }
                 break;
             }
             if (n > 0) {
+                if (!got_first_byte) {
+                    resp.ttfb_ms = monotonic_ms() - t_start;
+                    got_first_byte = true;
+                }
                 ssize_t consumed = nghttp2_session_mem_recv(session, rbuf, n);
-                ASTER_LOG_INFO("asternet-h2", "  iter=%d read=%d consumed=%zd got_status=%d stream_closed=%d",
+                ASTER_LOG_DEBUG("asternet-h2", "  iter=%d read=%d consumed=%zd got_status=%d stream_closed=%d",
                             iter, n, consumed, (int)h2ctx.got_status, (int)h2ctx.stream_closed);
                 if (consumed < 0) { ret = ASTERNET_ERR_PROTOCOL; break; }
                 if (consumed < n) {
@@ -477,8 +519,8 @@ int Http2Engine::request(const Request &req, Response &resp) {
 
     if (h2ctx.body_limit_exceeded) {
         ret = ASTERNET_ERR_BUFFER_TOO_SMALL;
-    } else if (ret == ASTERNET_OK && (!h2ctx.got_status
-                                      || h2ctx.stream_error != NGHTTP2_NO_ERROR)) {
+    } else if (ret == ASTERNET_OK && (!h2ctx.got_status || !h2ctx.got_end_stream
+                                       || h2ctx.stream_error != NGHTTP2_NO_ERROR)) {
         ret = ASTERNET_ERR_PROTOCOL;
     }
 
@@ -490,14 +532,16 @@ int Http2Engine::request(const Request &req, Response &resp) {
     SSL_CTX_free(ctx);
     close(fd);
 
-    struct timespec t_end;
-    clock_gettime(CLOCK_MONOTONIC, &t_end);
-    resp.total_ms = (t_end.tv_sec - t_start.tv_sec) * 1000
-                    + (t_end.tv_nsec - t_start.tv_nsec) / 1000000;
+    resp.total_ms = monotonic_ms() - t_start;
 
     ASTER_LOG_INFO("asternet-h2", "<== ret=%d status=%d body_len=%zu total_ms=%lld",
                ret, resp.http_status, resp.body.size(), (long long)resp.total_ms);
     resp.err_code = ret;
+    if (ret != ASTERNET_OK) {
+        resp.failure_stage = ret == ASTERNET_ERR_TIMEOUT ? "timeout"
+            : ret == ASTERNET_ERR_TLS ? "tls"
+            : ret == ASTERNET_ERR_CONNECT ? "connect" : "protocol";
+    }
     return ret;
 }
 

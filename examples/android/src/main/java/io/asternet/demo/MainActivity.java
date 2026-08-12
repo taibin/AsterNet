@@ -18,6 +18,9 @@ import io.asternet.AsterNet;
 import java.security.KeyStore;
 import java.security.cert.Certificate;
 import java.util.Enumeration;
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class MainActivity extends AppCompatActivity {
@@ -44,9 +47,14 @@ public final class MainActivity extends AppCompatActivity {
         Log.i(TAG, "AsterNet Demo starting, native version: " + AsterNet.nativeVersion());
 
         String caBundle = androidCaBundle();
+        String demoCaBundle = demoCaBundle();
+        if (!demoCaBundle.isEmpty()) {
+            caBundle += demoCaBundle;
+            Log.i(TAG, "Demo CA bundle appended: " + demoCaBundle.length() + " chars");
+        }
         Log.i(TAG, "CA bundle size: " + caBundle.length() + " chars");
-        client = AsterNet.createClient(true, caBundle);
-        Log.i(TAG, "Client created, enableH3=true");
+        client = AsterNet.createClient(true, false, caBundle, true);
+        Log.i(TAG, "Client created, enableH3=true allowPrivateNetworks=true (demo lab only)");
     }
 
     /** Called by Fragments to get the shared Client. */
@@ -89,6 +97,24 @@ public final class MainActivity extends AppCompatActivity {
         Log.i(TAG, "CA certs loaded=" + loaded + " skipped=" + skipped);
         if (loaded == 0) Log.w(TAG, "No CA certificates loaded — TLS will fail!");
         return bundle.toString();
+    }
+
+    private String demoCaBundle() {
+        try (InputStream input = getResources().openRawResource(R.raw.asternet_demo_ca)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            byte[] buffer = new byte[4096];
+            for (;;) {
+                int read = input.read(buffer);
+                if (read < 0) break;
+                output.write(buffer, 0, read);
+            }
+            String pem = output.toString(StandardCharsets.UTF_8.name()).trim();
+            if (!pem.contains("-----BEGIN CERTIFICATE-----")) return "";
+            return pem + "\n";
+        } catch (Exception error) {
+            Log.w(TAG, "No demo CA bundle loaded: " + error.getMessage());
+            return "";
+        }
     }
 
     @Override

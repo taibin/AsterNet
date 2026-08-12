@@ -13,13 +13,20 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 
 #include "asternet/asternet.h"
+#include "connection/connection_pool.h"
+#include "dns/dns_resolver.h"
 #include "engine/engine.h"
 #include "engine/http1_engine.h"
 #include "engine/http2_engine.h"
 #include "engine/protocol_selector.h"
+#include "monitor/metrics.h"
+#include "orchestrator/interceptor.h"
+#include "protocol/protocol.h"
+#include "sdt/quality_prober.h"
 
 #ifdef ASTERNET_ENABLE_XQUIC
 #include "engine/quic_engine.h"
@@ -51,15 +58,29 @@ public:
                             bool *out_degraded = nullptr);
 
 private:
+    int execute_transport(orchestrator::RequestContext &context, engine::Response &response);
+    void report_metrics(uint64_t request_id, uint64_t network_epoch,
+                        const orchestrator::RequestContext &context,
+                        const engine::Response &response, int result);
+    static const char *failure_stage_for(int result);
+
     asternet_client_config_t config_{};
     std::string ca_cert_pem_;
     std::atomic<bool> destroyed_{false};
-    mutable std::mutex lifecycle_mutex_;
+    std::atomic<uint64_t> next_request_id_{1};
+    std::atomic<uint64_t> network_epoch_{0};
+    mutable std::shared_mutex lifecycle_mutex_;
 
     std::shared_ptr<engine::NetworkEngine> h1_engine_;
     std::shared_ptr<engine::NetworkEngine> h2_engine_;
     std::shared_ptr<engine::NetworkEngine> h3_engine_;
     std::unique_ptr<engine::ProtocolSelector> selector_;
+    std::shared_ptr<dns::SmartDnsResolver> dns_resolver_;
+    std::shared_ptr<connection::ConnectionPool> connection_pool_;
+    std::shared_ptr<sdt::QualityProber> quality_prober_;
+    std::unique_ptr<orchestrator::RequestOrchestrator> orchestrator_;
+    std::shared_ptr<monitor::MetricsCollector> metrics_collector_;
+    std::unique_ptr<protocol::GatewayProtocol> gateway_protocol_;
 };
 
 }  // namespace asternet

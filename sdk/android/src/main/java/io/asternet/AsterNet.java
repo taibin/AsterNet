@@ -96,7 +96,8 @@ public final class AsterNet {
 
     public static native String nativeVersion();
     private static native long nativeCreateClient(int abiVersion, boolean enableH3,
-                                                   boolean allowInsecure, String caCertPem);
+                                                    boolean allowInsecure, String caCertPem,
+                                                    boolean allowPrivateNetworks);
     private static native void nativeDestroyClient(long handle);
     private static native String nativeRequest(long handle, String host, int port, String method,
                                                String path, int policy, String headers, byte[] body,
@@ -108,7 +109,13 @@ public final class AsterNet {
     }
 
     public static Client createClient(boolean enableH3, boolean allowInsecure, String caCertPem) {
-        return new Client(nativeCreateClient(ABI_VERSION, enableH3, allowInsecure, caCertPem));
+        return createClient(enableH3, allowInsecure, caCertPem, false);
+    }
+
+    public static Client createClient(boolean enableH3, boolean allowInsecure, String caCertPem,
+                                      boolean allowPrivateNetworks) {
+        return new Client(nativeCreateClient(ABI_VERSION, enableH3, allowInsecure, caCertPem,
+            allowPrivateNetworks));
     }
 
     private static Response requestNative(long handle, String host, int port, String method,

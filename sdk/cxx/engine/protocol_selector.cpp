@@ -33,7 +33,14 @@ int64_t ProtocolSelector::now_ms() const {
     return static_cast<int64_t>(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
 }
 
-bool ProtocolSelector::is_available(EngineType t, const std::string &host) {
+std::string ProtocolSelector::state_host_key(const Request &request) const {
+    return request.host + '\n' + std::to_string(request.port) + '\n'
+        + std::to_string(request.network_epoch);
+}
+
+bool ProtocolSelector::is_available(EngineType t, const Request &request) {
+    std::lock_guard<std::mutex> lock(states_mutex_);
+    const std::string host = state_host_key(request);
     auto it = states_.find({host, t});
     if (it == states_.end()) return true;
     if (it->second.banned_until_ms == 0) return true;
@@ -46,14 +53,21 @@ bool ProtocolSelector::is_available(EngineType t, const std::string &host) {
     return false;
 }
 
-void ProtocolSelector::record_failure(EngineType t, const std::string &host) {
+void ProtocolSelector::record_failure(EngineType t, const Request &request) {
+    std::lock_guard<std::mutex> lock(states_mutex_);
+    const std::string host = state_host_key(request);
+    if (states_.size() >= max_states_ && states_.find({host, t}) == states_.end()) {
+        states_.erase(states_.begin());
+    }
     auto &s = states_[{host, t}];
     if (++s.failures >= max_failures_) {
         s.banned_until_ms = now_ms() + cooldown_ms_;
     }
 }
 
-void ProtocolSelector::record_success(EngineType t, const std::string &host) {
+void ProtocolSelector::record_success(EngineType t, const Request &request) {
+    std::lock_guard<std::mutex> lock(states_mutex_);
+    const std::string host = state_host_key(request);
     auto it = states_.find({host, t});
     if (it != states_.end()) {
         it->second.failures = 0;
@@ -86,6 +100,7 @@ int ProtocolSelector::request_with_policy(const Request &req, asternet_protocol_
     const Step *chain = nullptr;
     size_t chain_size = 0;
     bool allow_fallback = true;
+    bool respect_circuit = true;
     switch (policy) {
     case ASTERNET_POLICY_AUTO:
     case ASTERNET_POLICY_PREFER_HTTP_3:
@@ -100,16 +115,19 @@ int ProtocolSelector::request_with_policy(const Request &req, asternet_protocol_
         chain = &h3_step;
         chain_size = 1;
         allow_fallback = false;
+        respect_circuit = false;
         break;
     case ASTERNET_POLICY_HTTP_2_ONLY:
         chain = &h2_step;
         chain_size = 1;
         allow_fallback = false;
+        respect_circuit = false;
         break;
     case ASTERNET_POLICY_HTTP_1_1_ONLY:
         chain = &h1_step;
         chain_size = 1;
         allow_fallback = false;
+        respect_circuit = false;
         break;
     default:
         resp.err_code = ASTERNET_ERR_INVALID_ARGUMENT;
@@ -122,6 +140,7 @@ int ProtocolSelector::request_with_policy(const Request &req, asternet_protocol_
 
     int last_error = ASTERNET_ERR_UNSUPPORTED;
     bool degraded = false;
+    int attempts = 0;
     const int64_t request_start_ms = now_ms();
     for (size_t i = 0; i < chain_size; ++i) {
         const Step &step = chain[i];
@@ -129,10 +148,9 @@ int ProtocolSelector::request_with_policy(const Request &req, asternet_protocol_
             ASTER_LOG_INFO("asternet-selector", "  skip %s (not built)", step.name);
             last_error = ASTERNET_ERR_UNSUPPORTED;
             if (!allow_fallback) break;
-            degraded = true;
             continue;
         }
-        if (!is_available(step.type, req.host)) {
+        if (respect_circuit && !is_available(step.type, req)) {
             ASTER_LOG_WARN("asternet-selector", "  skip %s (circuit open for %s)",
                        step.name, req.host.c_str());
             last_error = ASTERNET_ERR_DEGRADED;
@@ -152,12 +170,14 @@ int ProtocolSelector::request_with_policy(const Request &req, asternet_protocol_
         Request attempt = req;
         attempt.timeout_ms = static_cast<int>(remaining_ms);
         Response tmp;
+        ++attempts;
         const int ret = (*step.engine)->request(attempt, tmp);
         if (ret == ASTERNET_OK) {
-            record_success(step.type, req.host);
+            record_success(step.type, req);
             resp = std::move(tmp);
             resp.protocol = step.proto;
             resp.degraded = degraded;
+            resp.attempts = attempts;
             if (out_actual_proto) *out_actual_proto = step.proto;
             if (out_degraded) *out_degraded = degraded;
             ASTER_LOG_INFO("asternet-selector", "  %s OK status=%d body_len=%zu degraded=%d",
@@ -170,14 +190,15 @@ int ProtocolSelector::request_with_policy(const Request &req, asternet_protocol_
         ASTER_LOG_WARN("asternet-selector", "  %s FAIL ret=%d", step.name, ret);
 
         if (!is_retryable_error(ret)) break;
-        record_failure(step.type, req.host);
+        record_failure(step.type, req);
 
         // Retrying a non-idempotent request could duplicate an accepted write.
-        if (!allow_fallback || !req.idempotent) break;
+        if (!allow_fallback || !req.retry_safe) break;
         degraded = true;
     };
 
     if (resp.err_code == ASTERNET_OK) resp.err_code = last_error;
+    resp.attempts = attempts;
     if (out_degraded) *out_degraded = degraded;
     ASTER_LOG_WARN("asternet-selector", "<== request failed ret=%d degraded=%d", resp.err_code, degraded);
     return resp.err_code;

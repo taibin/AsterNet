@@ -171,22 +171,27 @@ int QuicEngine::request(const Request &req, Response &resp) {
 
     resp = Response{};
     resp.protocol = ASTERNET_PROTOCOL_HTTP_3;
-    ASTER_LOG_INFO("asternet-h3", "==> %s:%d %s %s timeout_ms=%d",
-               req.host.c_str(), req.port, req.method.c_str(), req.path.c_str(), req.timeout_ms);
+    resp.dns_ms = req.dns_ms;
+    ASTER_LOG_INFO("asternet-h3", "==> %s:%d %s timeout_ms=%d",
+               req.host.c_str(), req.port, req.method.c_str(), req.timeout_ms);
     if (init_engine() < 0) {
         return fail_early(ASTERNET_ERR_INTERNAL);
     }
 
-    // 1. DNS 解析
+    // 1. DNS 解析。统一 Resolver 已提供 connect_host 时，跳过系统 DNS；逻辑 host
+    // 仍用于 SNI、:authority 和证书校验。
     struct addrinfo hints{}, *res = nullptr;
     hints.ai_family = AF_UNSPEC;  // 同时支持 IPv4/IPv6，兼容纯 IPv6+NAT64 网络
     hints.ai_socktype = SOCK_DGRAM;
     char port_str[8];
     snprintf(port_str, sizeof(port_str), "%u", req.port);
-    if (getaddrinfo(req.host.c_str(), port_str, &hints, &res) != 0 || res == nullptr) {
+    const char *endpoint = req.connect_host.empty() ? req.host.c_str() : req.connect_host.c_str();
+    const int64_t dns_start_ms = monotonic_ms();
+    if (getaddrinfo(endpoint, port_str, &hints, &res) != 0 || res == nullptr) {
         if (res != nullptr) freeaddrinfo(res);
         return fail_early(ASTERNET_ERR_DNS);
     }
+    resp.dns_ms = req.dns_ms >= 0 ? req.dns_ms : monotonic_ms() - dns_start_ms;
     struct sockaddr_storage srv_addr;
     socklen_t srv_addr_len = res->ai_addrlen;
     memcpy(&srv_addr, res->ai_addr, res->ai_addrlen);
@@ -194,6 +199,7 @@ int QuicEngine::request(const Request &req, Response &resp) {
     freeaddrinfo(res);
 
     // 2. 创建非阻塞 UDP socket + connect（使用解析到的地址族）
+    const int64_t connect_start_ms = monotonic_ms();
     int sock_fd = socket(addr_family, SOCK_DGRAM, 0);
     if (sock_fd < 0) {
         return fail_early(ASTERNET_ERR_INTERNAL);
@@ -207,6 +213,7 @@ int QuicEngine::request(const Request &req, Response &resp) {
         close(sock_fd);
         return fail_early(ASTERNET_ERR_CONNECT);
     }
+    resp.connect_ms = monotonic_ms() - connect_start_ms;
 
     // 3. 构造请求上下文
     cur_req_ = std::make_unique<RequestContext>();
@@ -287,7 +294,11 @@ int QuicEngine::request(const Request &req, Response &resp) {
     conn_settings.enable_multipath = 0;   // 关闭 multipath（POC 单路径，避免协商触发 null 回调）
     conn_settings.multipath_version = (xqc_multipath_version_t)0;
     xqc_conn_ssl_config_t conn_ssl_cfg = {};
-    if (!allow_insecure_tls_for_testing_ && !cur_req_->allow_insecure_tls_for_testing) {
+    bool allow_insecure = false;
+#ifdef ASTERNET_ALLOW_INSECURE_TLS_FOR_TESTING
+    allow_insecure = allow_insecure_tls_for_testing_;
+#endif
+    if (!allow_insecure) {
         conn_ssl_cfg.cert_verify_flag |= XQC_TLS_CERT_FLAG_NEED_VERIFY;
     }
     const xqc_cid_t *cid = xqc_h3_connect(engine_, &conn_settings, nullptr, 0,
@@ -430,9 +441,9 @@ void QuicEngine::log_write_err_cb(xqc_log_level_t /*lvl*/, const void *buf, size
 int QuicEngine::cert_verify_cb(const unsigned char *certs[], const size_t cert_len[],
                                size_t certs_len, void *user_data) {
     auto *self = static_cast<QuicEngine *>(user_data);
-    if (self != nullptr && self->cur_req_ != nullptr
-        && (self->allow_insecure_tls_for_testing_
-            || self->cur_req_->allow_insecure_tls_for_testing)) return 0;
+#ifdef ASTERNET_ALLOW_INSECURE_TLS_FOR_TESTING
+    if (self != nullptr && self->allow_insecure_tls_for_testing_) return 0;
+#endif
     if (self != nullptr && self->cur_req_ != nullptr
         && asternet::platform::verify_certificate_chain(self->cur_req_->ca_cert_pem,
                                                          self->cur_req_->host,

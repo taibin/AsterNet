@@ -15,7 +15,7 @@
         <com.google.android.material.textview.MaterialTextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="Build your own request to any service."
+            android:text="Build your own request. This demo client allows private network targets for lab testing; keep SDK defaults locked down in production."
             android:textAppearance="?attr/textAppearanceBodyMedium"
             android:textColor="?attr/colorOnSurfaceVariant"
             android:layout_marginBottom="16dp" />

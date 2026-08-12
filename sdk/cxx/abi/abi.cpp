@@ -64,8 +64,30 @@ int default_timeout_ms(const asternet::Client &client, int request_timeout_ms) {
 
 bool is_idempotent_method(const char *method) {
     return std::strcmp(method, "GET") == 0 || std::strcmp(method, "HEAD") == 0
-        || std::strcmp(method, "OPTIONS") == 0 || std::strcmp(method, "PUT") == 0
-        || std::strcmp(method, "DELETE") == 0;
+        || std::strcmp(method, "OPTIONS") == 0;
+}
+
+bool has_idempotency_key(const asternet_header_t *headers, size_t header_count) {
+    for (size_t i = 0; i < header_count; ++i) {
+        const char *name = headers[i].name;
+        if (name == nullptr || headers[i].value == nullptr || headers[i].value[0] == '\0') continue;
+        static constexpr char kKey[] = "idempotency-key";
+        size_t length = std::strlen(name);
+        if (length != sizeof(kKey) - 1) continue;
+        bool match = true;
+        for (size_t j = 0; j < length; ++j) {
+            if (std::tolower(static_cast<unsigned char>(name[j])) != kKey[j]) {
+                match = false;
+                break;
+            }
+        }
+        if (!match) continue;
+        for (const unsigned char *p = reinterpret_cast<const unsigned char *>(headers[i].value);
+             *p != '\0'; ++p) {
+            if (!std::isspace(*p)) return true;
+        }
+    }
+    return false;
 }
 
 bool contains_crlf(const char *value) {
@@ -258,11 +280,10 @@ ASTERNET_API asternet_result_t asternet_client_request_sync(
     internal_request.method = request->method;
     internal_request.path = request->path;
     internal_request.timeout_ms = default_timeout_ms(*internal_client,
-                                                      request->timeout_ms);
-    internal_request.idempotent = request->idempotent != 0 || is_idempotent_method(request->method);
-    internal_request.allow_insecure_tls_for_testing =
-        internal_client->config().allow_insecure_tls_for_testing != 0
-        || request->allow_insecure_tls_for_testing != 0;
+                                                       request->timeout_ms);
+    // Kept in the ABI for backward layout compatibility. TLS verification bypasses are never
+    // enabled by the production core.
+    internal_request.allow_insecure_tls_for_testing = false;
     internal_request.ca_cert_pem = internal_client->ca_cert_pem();
     const int configured_max_body = internal_client->config().max_response_body_bytes;
     if (configured_max_body > 0) {
@@ -271,6 +292,10 @@ ASTERNET_API asternet_result_t asternet_client_request_sync(
     if (request->body_len > 0) {
         internal_request.body.assign(reinterpret_cast<const char *>(request->body), request->body_len);
     }
+    internal_request.idempotent = request->idempotent != 0
+        || (internal_request.body.empty() && is_idempotent_method(request->method));
+    internal_request.retry_safe = (internal_request.body.empty() && is_idempotent_method(request->method))
+        || (request->idempotent != 0 && has_idempotency_key(request->headers, request->header_count));
     internal_request.headers.reserve(request->header_count);
     for (size_t i = 0; i < request->header_count; ++i) {
         const asternet_header_t &header = request->headers[i];

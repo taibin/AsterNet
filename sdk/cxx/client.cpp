@@ -3,7 +3,10 @@
  */
 #include "client.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <sstream>
 
 #include "asternet/version.h"
 #include "platform/log.h"
@@ -36,6 +39,17 @@ private:
     bool installed_;
 };
 
+int64_t monotonic_ms() {
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    return std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+}
+
+bool is_replayable_safe_method(const engine::Request &request) {
+    const std::string &method = request.method;
+    if (!request.body.empty()) return false;
+    return method == "GET" || method == "HEAD" || method == "OPTIONS";
+}
+
 }  // namespace
 
 bool Client::check_abi(uint32_t abi_version) {
@@ -47,7 +61,9 @@ bool Client::check_abi(uint32_t abi_version) {
 Client::Client(const asternet_client_config_t &cfg)
     : config_(cfg), ca_cert_pem_(cfg.ca_cert_pem != nullptr ? cfg.ca_cert_pem : "") {
     // 构造三引擎 + 协议选择器（降级链 H3→H2→H1.1）
-    const bool allow_insecure = config_.allow_insecure_tls_for_testing != 0;
+    // ABI keeps the deprecated test-only field for layout compatibility, but production core never
+    // disables certificate or hostname verification.
+    const bool allow_insecure = false;
     h1_engine_ = std::make_shared<engine::Http1Engine>(allow_insecure, ca_cert_pem_);
     h2_engine_ = std::make_shared<engine::Http2Engine>(allow_insecure, ca_cert_pem_);
 #ifdef ASTERNET_ENABLE_XQUIC
@@ -56,40 +72,85 @@ Client::Client(const asternet_client_config_t &cfg)
     }
 #endif
     selector_ = std::make_unique<engine::ProtocolSelector>(h3_engine_, h2_engine_, h1_engine_);
+    dns::SmartDnsResolverImpl::Config dns_config;
+    dns_config.allow_private_addresses = config_.allow_private_networks != 0;
+    dns_resolver_ = std::make_shared<dns::SmartDnsResolverImpl>(dns_config);
+    auto pool = std::make_shared<connection::ConnectionPoolImpl>();
+    std::weak_ptr<engine::NetworkEngine> h1 = h1_engine_;
+    std::weak_ptr<engine::NetworkEngine> h2 = h2_engine_;
+    std::weak_ptr<engine::NetworkEngine> h3 = h3_engine_;
+    pool->set_prefetch_handler([h3](const std::string &host) {
+        const std::shared_ptr<engine::NetworkEngine> engine = h3.lock();
+        return engine ? engine->prefetch(host) : ASTERNET_ERR_UNSUPPORTED;
+    });
+    pool->set_migration_handler([h1, h2, h3] {
+        int result = ASTERNET_ERR_UNSUPPORTED;
+        if (const std::shared_ptr<engine::NetworkEngine> engine = h1.lock()) {
+            result = engine->migrate_connection();
+        }
+        if (const std::shared_ptr<engine::NetworkEngine> engine = h2.lock()) {
+            const int current = engine->migrate_connection();
+            if (result != ASTERNET_OK) result = current;
+        }
+        if (const std::shared_ptr<engine::NetworkEngine> engine = h3.lock()) {
+            const int current = engine->migrate_connection();
+            if (result != ASTERNET_OK) result = current;
+        }
+        return result;
+    });
+    connection_pool_ = std::move(pool);
+    quality_prober_ = std::make_shared<sdt::QualityProberImpl>();
+    orchestrator_ = std::make_unique<orchestrator::RequestOrchestrator>(quality_prober_);
+    metrics_collector_ = std::make_shared<monitor::MetricsCollectorImpl>();
+    gateway_protocol_ = std::make_unique<protocol::DefaultGatewayProtocol>();
 }
 
 Client::~Client() {
-    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    std::unique_lock<std::shared_mutex> lock(lifecycle_mutex_);
     destroyed_.store(true, std::memory_order_release);
+    if (connection_pool_) connection_pool_->evict_all();
+    gateway_protocol_.reset();
+    metrics_collector_.reset();
+    orchestrator_.reset();
+    quality_prober_.reset();
+    connection_pool_.reset();
+    dns_resolver_.reset();
     selector_.reset();
     h3_engine_.reset();
     h2_engine_.reset();
     h1_engine_.reset();
 }
 
-void Client::on_network_change(asternet_network_t /*net*/) {
+void Client::on_network_change(asternet_network_t net) {
     if (is_active_client(this)) return;
-    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
-    // TODO(阶段3): 通知 connection::ConnectionMigration 执行 QUIC 连接迁移；
-    //              通知 sdt::QualityProber 重置探测；通知 dns 预解析切换后域名。
+    std::shared_lock<std::shared_mutex> lock(lifecycle_mutex_);
+    if (destroyed_.load(std::memory_order_acquire)) return;
+    const uint64_t epoch = network_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (connection_pool_) {
+        connection_pool_->on_network_change(epoch, net);
+        // This returns UNSUPPORTED until the H3 engine owns persistent connections. Cache and
+        // lease invalidation above is still required for every transport.
+        (void)connection_pool_->migrate(net);
+    }
+    if (dns_resolver_) dns_resolver_->on_network_change(epoch);
+    if (quality_prober_) quality_prober_->on_network_change(epoch, net);
 }
 
 std::string Client::dump_diag() const {
     if (is_active_client(const_cast<Client *>(this))) return "{}";
-    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
-    // TODO(阶段1): 输出线程状态 / 连接池 / DNS 缓存快照。
-    return std::string("{}");
+    std::shared_lock<std::shared_mutex> lock(lifecycle_mutex_);
+    std::ostringstream out;
+    out << "{\"network_epoch\":" << network_epoch_.load(std::memory_order_acquire)
+        << ",\"dns\":" << (dns_resolver_ ? dns_resolver_->dump() : "{}")
+        << ",\"connections\":" << (connection_pool_ ? connection_pool_->dump() : "{}")
+        << ",\"quality\":" << (quality_prober_ ? quality_prober_->dump() : "{}")
+        << ",\"metrics\":" << (metrics_collector_ ? metrics_collector_->dump() : "{}")
+        << "}";
+    return out.str();
 }
 
 int Client::request(const engine::Request &req, engine::Response &resp) {
-    if (is_active_client(this) || g_active_client_count >= kMaxActiveClients) {
-        return ASTERNET_ERR_INTERNAL;
-    }
-    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
-    ActiveRequestGuard active_guard(this);
-    if (destroyed_.load(std::memory_order_acquire)) return ASTERNET_ERR_CANCELED;
-    if (!selector_) return ASTERNET_ERR_INTERNAL;
-    return selector_->request_with_policy(req, ASTERNET_POLICY_AUTO, resp, nullptr, nullptr);
+    return request_with_policy(req, ASTERNET_POLICY_AUTO, resp, nullptr, nullptr);
 }
 
 int Client::request_with_policy(const engine::Request &req, asternet_protocol_policy_t policy,
@@ -98,17 +159,125 @@ int Client::request_with_policy(const engine::Request &req, asternet_protocol_po
     if (is_active_client(this) || g_active_client_count >= kMaxActiveClients) {
         return ASTERNET_ERR_INTERNAL;
     }
-    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    std::shared_lock<std::shared_mutex> lock(lifecycle_mutex_);
     ActiveRequestGuard active_guard(this);
-    ASTER_LOG_INFO("asternet-client", "==> %s:%d %s %s policy=%d",
-               req.host.c_str(), req.port, req.method.c_str(), req.path.c_str(), static_cast<int>(policy));
     if (destroyed_.load(std::memory_order_acquire)) return ASTERNET_ERR_CANCELED;
-    if (!selector_) return ASTERNET_ERR_INTERNAL;
-    int ret = selector_->request_with_policy(req, policy, resp, out_actual_proto, out_degraded);
-    int actual = out_actual_proto ? (int)*out_actual_proto : -1;
-    ASTER_LOG_INFO("asternet-client", "<== ret=%d actual_proto=%d status=%d total_ms=%lld body_len=%zu",
-               ret, actual, resp.http_status, (long long)resp.total_ms, resp.body.size());
+    if (!selector_ || !orchestrator_) return ASTERNET_ERR_INTERNAL;
+
+    const int64_t started_ms = monotonic_ms();
+    orchestrator::RequestContext context;
+    context.request = req;
+    context.request.allow_insecure_tls_for_testing = false;
+    context.request.timeout_ms = req.timeout_ms > 0 ? req.timeout_ms
+        : (config_.default_timeout_ms > 0 ? config_.default_timeout_ms : 15000);
+    context.policy = policy;
+    context.request_id = next_request_id_.fetch_add(1, std::memory_order_relaxed);
+    context.network_epoch = network_epoch_.load(std::memory_order_acquire);
+    context.request.network_epoch = context.network_epoch;
+    context.request.retry_safe = req.retry_safe || is_replayable_safe_method(context.request);
+    context.max_retries = context.request.retry_safe ? 1 : 0;
+    context.deadline_ms = started_ms + context.request.timeout_ms;
+
+    const int ret = orchestrator_->execute(context, resp,
+        [this](orchestrator::RequestContext &request_context, engine::Response &response) {
+            return execute_transport(request_context, response);
+        });
+    if (resp.total_ms < 0) resp.total_ms = monotonic_ms() - started_ms;
+    if (resp.failure_stage.empty() && ret != ASTERNET_OK) {
+        resp.failure_stage = failure_stage_for(ret);
+    }
+    resp.attempts = std::max(resp.attempts, context.attempts);
+    if (out_actual_proto) *out_actual_proto = resp.protocol;
+    if (out_degraded) *out_degraded = resp.degraded;
+    report_metrics(context.request_id, context.network_epoch, context, resp, ret);
     return ret;
+}
+
+int Client::execute_transport(orchestrator::RequestContext &context, engine::Response &response) {
+    if (!dns_resolver_ || !connection_pool_ || !quality_prober_ || !selector_) {
+        response.err_code = ASTERNET_ERR_INTERNAL;
+        response.failure_stage = "initialization";
+        return response.err_code;
+    }
+
+    const dns::ResolveResult resolution = dns_resolver_->resolve_with_metadata(
+        context.request.host, context.network_epoch, context.request.timeout_ms);
+    response.dns_ms = resolution.elapsed_ms;
+    if (resolution.error != ASTERNET_OK || resolution.addresses.empty()) {
+        response.err_code = ASTERNET_ERR_DNS;
+        response.failure_stage = "dns";
+        quality_prober_->observe(false, -1);
+        return response.err_code;
+    }
+
+    const size_t max_addresses = context.request.retry_safe
+        ? std::min<size_t>(2, resolution.addresses.size()) : 1;
+    int result = ASTERNET_ERR_CONNECT;
+    for (size_t index = 0; index < max_addresses; ++index) {
+        engine::Request attempt = context.request;
+        attempt.connect_host = resolution.addresses[index].ip;
+        attempt.dns_ms = resolution.elapsed_ms;
+
+        connection::Origin origin;
+        origin.host = attempt.host;
+        origin.port = attempt.port;
+        origin.network_epoch = context.network_epoch;
+        const connection::ConnectionLease lease = connection_pool_->acquire(origin);
+        result = selector_->request_with_policy(attempt, context.policy, response, nullptr, nullptr);
+        connection_pool_->release(lease, result == ASTERNET_OK);
+
+        const int observed_rtt = response.ttfb_ms >= 0
+            ? static_cast<int>(response.ttfb_ms) : static_cast<int>(response.total_ms);
+        dns_resolver_->report_connection_result(attempt.host, attempt.connect_host,
+                                                context.network_epoch, result == ASTERNET_OK,
+                                                observed_rtt);
+        quality_prober_->observe(result == ASTERNET_OK, observed_rtt);
+        if (result == ASTERNET_OK || result != ASTERNET_ERR_CONNECT) break;
+    }
+    if (response.dns_ms < 0) response.dns_ms = resolution.elapsed_ms;
+    if (result != ASTERNET_OK && response.failure_stage.empty()) {
+        response.failure_stage = failure_stage_for(result);
+    }
+    return result;
+}
+
+void Client::report_metrics(uint64_t request_id, uint64_t network_epoch,
+                            const orchestrator::RequestContext &context,
+                            const engine::Response &response, int result) {
+    if (!metrics_collector_) return;
+    asternet_response_info_t info{};
+    info.result = static_cast<asternet_result_t>(result);
+    info.http_status = response.http_status;
+    info.protocol = response.protocol;
+    info.degraded = response.degraded ? 1 : 0;
+    info.body_size = response.body.size();
+    info.body_copied = response.body.size();
+    info.dns_ms = response.dns_ms;
+    info.connect_ms = response.connect_ms;
+    info.tls_ms = response.tls_ms;
+    info.ttfb_ms = response.ttfb_ms;
+    info.total_ms = response.total_ms;
+    monitor::RequestMetrics metrics;
+    metrics.response = info;
+    metrics.request_id = request_id;
+    metrics.network_epoch = network_epoch;
+    metrics.attempts = response.attempts;
+    metrics.connection_reused = response.connection_reused;
+    metrics.deduplicated = context.deduplicated;
+    metrics.failure_stage = response.failure_stage;
+    metrics_collector_->report_request(metrics);
+}
+
+const char *Client::failure_stage_for(int result) {
+    switch (result) {
+    case ASTERNET_ERR_DNS: return "dns";
+    case ASTERNET_ERR_CONNECT: return "connect";
+    case ASTERNET_ERR_TLS: return "tls";
+    case ASTERNET_ERR_TIMEOUT: return "timeout";
+    case ASTERNET_ERR_PROTOCOL: return "protocol";
+    case ASTERNET_ERR_CANCELED: return "canceled";
+    default: return "internal";
+    }
 }
 
 }  // namespace asternet

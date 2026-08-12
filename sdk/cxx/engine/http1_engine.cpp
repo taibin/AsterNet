@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cerrno>
+#include <chrono>
 
 #include "platform/log.h"
 #include "platform/tls.h"
@@ -33,6 +34,11 @@ namespace engine {
 namespace {
 
 // 阻塞 connect 带超时（SO_RCVTIMEO/SO_SNDTIMEO）
+int64_t monotonic_ms() {
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    return std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+}
+
 int connect_with_timeout(const char *host, uint16_t port, int timeout_ms) {
     struct addrinfo hints{}, *res = nullptr;
     hints.ai_family = AF_UNSPEC;  // 同时支持 IPv4/IPv6，兼容纯 IPv6+NAT64 网络
@@ -54,19 +60,6 @@ int connect_with_timeout(const char *host, uint16_t port, int timeout_ms) {
     }
     freeaddrinfo(res);
     return fd;
-}
-
-// 读取至缓冲区填满或返回（同步，依赖 socket 超时）
-ssize_t read_n(SSL *ssl, int fd, uint8_t *buf, size_t n) {
-    size_t got = 0;
-    while (got < n) {
-        ssize_t r = SSL_read(ssl, buf + got, n - got);
-        if (r > 0) { got += r; continue; }
-        int err = SSL_get_error(ssl, r);
-        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) continue;
-        break;
-    }
-    return got;
 }
 
 enum class ChunkParseResult { kIncomplete, kInvalid, kComplete };
@@ -109,58 +102,123 @@ ChunkParseResult decode_chunked(const std::string &raw, std::string &out) {
 
 }  // namespace
 
-int Http1Engine::request(const Request &req, Response &resp) {
-    resp.protocol = ASTERNET_PROTOCOL_HTTP_1_1;
-    ASTER_LOG_INFO("asternet-h1", "==> %s:%d %s %s timeout_ms=%d",
-               req.host.c_str(), req.port, req.method.c_str(), req.path.c_str(), req.timeout_ms);
-    struct timespec t_start;
-    clock_gettime(CLOCK_MONOTONIC, &t_start);
+struct Http1Engine::PooledConnection {
+    int fd = -1;
+    SSL_CTX *ctx = nullptr;
+    SSL *ssl = nullptr;
+    std::string host;
+    std::string endpoint;
+    uint16_t port = 0;
+    std::string ca_cert_pem;
+    bool allow_insecure = false;
+};
 
-    // 1. TCP connect
-    int fd = connect_with_timeout(req.host.c_str(), req.port, req.timeout_ms);
-    if (fd < 0) {
-        resp.err_code = ASTERNET_ERR_CONNECT;
-        return ASTERNET_ERR_CONNECT;
+Http1Engine::Http1Engine(bool allow_insecure_tls_for_testing, std::string ca_cert_pem)
+    : allow_insecure_tls_for_testing_(allow_insecure_tls_for_testing),
+      ca_cert_pem_(std::move(ca_cert_pem)) {}
+
+Http1Engine::~Http1Engine() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    close_connection();
+}
+
+void Http1Engine::close_connection() {
+    if (!connection_) return;
+    if (connection_->ssl != nullptr) SSL_free(connection_->ssl);
+    if (connection_->ctx != nullptr) SSL_CTX_free(connection_->ctx);
+    if (connection_->fd >= 0) close(connection_->fd);
+    connection_.reset();
+}
+
+int Http1Engine::ensure_connection(const Request &req, Response &resp, bool &reused) {
+    const std::string endpoint = req.connect_host.empty() ? req.host : req.connect_host;
+#ifdef ASTERNET_ALLOW_INSECURE_TLS_FOR_TESTING
+    const bool allow_insecure = allow_insecure_tls_for_testing_;
+#else
+    const bool allow_insecure = false;
+#endif
+    const std::string ca_bundle = req.ca_cert_pem.empty() ? ca_cert_pem_ : req.ca_cert_pem;
+    if (connection_ && connection_->host == req.host && connection_->endpoint == endpoint
+        && connection_->port == req.port && connection_->ca_cert_pem == ca_bundle
+        && connection_->allow_insecure == allow_insecure) {
+        reused = true;
+        return ASTERNET_OK;
     }
+    close_connection();
 
-    // 2. TLS 握手
+    const int64_t connect_start = monotonic_ms();
+    const int fd = connect_with_timeout(endpoint.c_str(), req.port, req.timeout_ms);
+    resp.connect_ms = monotonic_ms() - connect_start;
+    if (fd < 0) return ASTERNET_ERR_CONNECT;
+
     SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
-    if (ctx == nullptr) { close(fd); resp.err_code = ASTERNET_ERR_TLS; return ASTERNET_ERR_TLS; }
-    const bool allow_insecure = allow_insecure_tls_for_testing_
-                             || req.allow_insecure_tls_for_testing;
+    if (ctx == nullptr) {
+        close(fd);
+        return ASTERNET_ERR_TLS;
+    }
     SSL_CTX_set_verify(ctx, allow_insecure ? SSL_VERIFY_NONE : SSL_VERIFY_PEER, nullptr);
-    const std::string &ca_bundle = req.ca_cert_pem.empty() ? ca_cert_pem_ : req.ca_cert_pem;
     const bool trust_ready = allow_insecure
         || (!ca_bundle.empty() ? asternet::platform::load_ca_bundle(ctx, ca_bundle)
                                : SSL_CTX_set_default_verify_paths(ctx) == 1);
     if (!trust_ready) {
         SSL_CTX_free(ctx);
         close(fd);
-        resp.err_code = ASTERNET_ERR_TLS;
         return ASTERNET_ERR_TLS;
     }
-
     SSL *ssl = SSL_new(ctx);
     if (ssl == nullptr) {
         SSL_CTX_free(ctx);
         close(fd);
-        resp.err_code = ASTERNET_ERR_OUT_OF_MEMORY;
         return ASTERNET_ERR_OUT_OF_MEMORY;
     }
-    SSL_set_tlsext_host_name(ssl, req.host.c_str());  // SNI
-    if (!allow_insecure && SSL_set1_host(ssl, req.host.c_str()) != 1) {
+    if (SSL_set_tlsext_host_name(ssl, req.host.c_str()) != 1
+        || (!allow_insecure && SSL_set1_host(ssl, req.host.c_str()) != 1)) {
         SSL_free(ssl);
         SSL_CTX_free(ctx);
         close(fd);
-        resp.err_code = ASTERNET_ERR_TLS;
         return ASTERNET_ERR_TLS;
     }
     SSL_set_fd(ssl, fd);
+    const int64_t tls_start = monotonic_ms();
     if (SSL_connect(ssl) != 1) {
-        SSL_free(ssl); SSL_CTX_free(ctx); close(fd);
-        resp.err_code = ASTERNET_ERR_TLS;
+        resp.tls_ms = monotonic_ms() - tls_start;
+        SSL_free(ssl);
+        SSL_CTX_free(ctx);
+        close(fd);
         return ASTERNET_ERR_TLS;
     }
+    resp.tls_ms = monotonic_ms() - tls_start;
+    connection_ = std::make_unique<PooledConnection>();
+    connection_->fd = fd;
+    connection_->ctx = ctx;
+    connection_->ssl = ssl;
+    connection_->host = req.host;
+    connection_->endpoint = endpoint;
+    connection_->port = req.port;
+    connection_->ca_cert_pem = ca_bundle;
+    connection_->allow_insecure = allow_insecure;
+    return ASTERNET_OK;
+}
+
+int Http1Engine::request(const Request &req, Response &resp) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    resp = Response{};
+    resp.protocol = ASTERNET_PROTOCOL_HTTP_1_1;
+    resp.dns_ms = req.dns_ms;
+    ASTER_LOG_INFO("asternet-h1", "==> %s:%d %s timeout_ms=%d",
+               req.host.c_str(), req.port, req.method.c_str(), req.timeout_ms);
+    const int64_t t_start = monotonic_ms();
+
+    bool reused = false;
+    const int connection_result = ensure_connection(req, resp, reused);
+    if (connection_result != ASTERNET_OK) {
+        resp.err_code = connection_result;
+        resp.failure_stage = connection_result == ASTERNET_ERR_CONNECT ? "connect" : "tls";
+        resp.total_ms = monotonic_ms() - t_start;
+        return connection_result;
+    }
+    resp.connection_reused = reused;
+    SSL *ssl = connection_->ssl;
 
     // 3. 构造请求
     // Host 头：非默认端口需显式携带端口号（RFC 7230）
@@ -171,7 +229,7 @@ int Http1Engine::request(const Request &req, Response &resp) {
     std::string req_str = req.method + " " + req.path + " HTTP/1.1\r\n";
     req_str += "Host: " + host_hdr + "\r\n";
     req_str += "User-Agent: asternet/0.1\r\n";
-    req_str += "Connection: close\r\n";  // POC 不复用连接
+    req_str += "Connection: close\r\n";
     bool has_body = !req.body.empty();
     if (has_body) {
         req_str += "Content-Length: " + std::to_string(req.body.size()) + "\r\n";
@@ -188,8 +246,10 @@ int Http1Engine::request(const Request &req, Response &resp) {
         const int write_size = static_cast<int>(std::min(remaining, static_cast<size_t>(INT_MAX)));
         const int n = SSL_write(ssl, req_str.data() + written, write_size);
         if (n <= 0) {
-            SSL_free(ssl); SSL_CTX_free(ctx); close(fd);
+            close_connection();
             resp.err_code = ASTERNET_ERR_PROTOCOL;
+            resp.failure_stage = "write";
+            resp.total_ms = monotonic_ms() - t_start;
             return ASTERNET_ERR_PROTOCOL;
         }
         written += static_cast<size_t>(n);
@@ -200,6 +260,7 @@ int Http1Engine::request(const Request &req, Response &resp) {
     char buf[4096];
     size_t header_end = std::string::npos;
     constexpr size_t kMaxResponseHeaders = 64 * 1024;
+    const int64_t first_byte_start = monotonic_ms();
     while (header_end == std::string::npos && raw.size() <= kMaxResponseHeaders) {
         ssize_t r = SSL_read(ssl, buf, sizeof(buf));
         if (r <= 0) break;
@@ -207,10 +268,13 @@ int Http1Engine::request(const Request &req, Response &resp) {
         header_end = raw.find("\r\n\r\n");
     }
     if (header_end == std::string::npos || raw.size() > kMaxResponseHeaders) {
-        SSL_free(ssl); SSL_CTX_free(ctx); close(fd);
+        close_connection();
         resp.err_code = ASTERNET_ERR_PROTOCOL;
+        resp.failure_stage = "ttfb";
+        resp.total_ms = monotonic_ms() - t_start;
         return ASTERNET_ERR_PROTOCOL;
     }
+    resp.ttfb_ms = monotonic_ms() - first_byte_start;
 
     // 解析状态行
     size_t sp1 = raw.find(' ');
@@ -250,22 +314,28 @@ int Http1Engine::request(const Request &req, Response &resp) {
             body.append(buf, r);
         }
         if (parse_result != ChunkParseResult::kComplete) {
-            SSL_free(ssl); SSL_CTX_free(ctx); close(fd);
+            close_connection();
             resp.err_code = body.size() > max_body + kMaxResponseHeaders
-                                ? ASTERNET_ERR_BUFFER_TOO_SMALL
-                                                    : ASTERNET_ERR_PROTOCOL;
+                                 ? ASTERNET_ERR_BUFFER_TOO_SMALL
+                                                     : ASTERNET_ERR_PROTOCOL;
+            resp.failure_stage = "body";
+            resp.total_ms = monotonic_ms() - t_start;
             return resp.err_code;
         }
         if (decoded_body.size() > max_body) {
-            SSL_free(ssl); SSL_CTX_free(ctx); close(fd);
+            close_connection();
             resp.err_code = ASTERNET_ERR_BUFFER_TOO_SMALL;
+            resp.failure_stage = "body";
+            resp.total_ms = monotonic_ms() - t_start;
             return ASTERNET_ERR_BUFFER_TOO_SMALL;
         }
         resp.body = std::move(decoded_body);
     } else if (cl != std::string::npos) {
         if (cl > max_body) {
-            SSL_free(ssl); SSL_CTX_free(ctx); close(fd);
+            close_connection();
             resp.err_code = ASTERNET_ERR_BUFFER_TOO_SMALL;
+            resp.failure_stage = "body";
+            resp.total_ms = monotonic_ms() - t_start;
             return ASTERNET_ERR_BUFFER_TOO_SMALL;
         }
         while (body.size() < cl) {
@@ -276,8 +346,10 @@ int Http1Engine::request(const Request &req, Response &resp) {
             body.append(buf, r);
         }
         if (body.size() < cl) {
-            SSL_free(ssl); SSL_CTX_free(ctx); close(fd);
+            close_connection();
             resp.err_code = ASTERNET_ERR_PROTOCOL;
+            resp.failure_stage = "body";
+            resp.total_ms = monotonic_ms() - t_start;
             return ASTERNET_ERR_PROTOCOL;
         }
         resp.body = body.substr(0, cl);
@@ -291,32 +363,41 @@ int Http1Engine::request(const Request &req, Response &resp) {
             body.append(buf, r);
         }
         if (body.size() > max_body) {
-            SSL_free(ssl); SSL_CTX_free(ctx); close(fd);
+            close_connection();
             resp.err_code = ASTERNET_ERR_BUFFER_TOO_SMALL;
+            resp.failure_stage = "body";
+            resp.total_ms = monotonic_ms() - t_start;
             return ASTERNET_ERR_BUFFER_TOO_SMALL;
         }
         resp.body = body;
     }
     if (resp.body.size() > req.max_response_body_bytes) {
-        SSL_free(ssl);
-        SSL_CTX_free(ctx);
-        close(fd);
+        close_connection();
         resp.err_code = ASTERNET_ERR_BUFFER_TOO_SMALL;
+        resp.failure_stage = "body";
+        resp.total_ms = monotonic_ms() - t_start;
         return ASTERNET_ERR_BUFFER_TOO_SMALL;
     }
 
-    SSL_free(ssl);
-    SSL_CTX_free(ctx);
-    close(fd);
+    close_connection();
 
-    struct timespec t_end;
-    clock_gettime(CLOCK_MONOTONIC, &t_end);
-    resp.total_ms = (t_end.tv_sec - t_start.tv_sec) * 1000
-                    + (t_end.tv_nsec - t_start.tv_nsec) / 1000000;
+    resp.total_ms = monotonic_ms() - t_start;
 
     ASTER_LOG_INFO("asternet-h1", "<== OK status=%d body_len=%zu total_ms=%lld",
                resp.http_status, resp.body.size(), (long long)resp.total_ms);
     resp.err_code = ASTERNET_OK;
+    return ASTERNET_OK;
+}
+
+int Http1Engine::prefetch(const std::string & /*host*/) {
+    // A hostname alone cannot establish a safe TLS connection because port, CA and SNI policy
+    // belong to a concrete request. The Client keeps this operation explicitly unsupported.
+    return ASTERNET_ERR_UNSUPPORTED;
+}
+
+int Http1Engine::migrate_connection() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    close_connection();
     return ASTERNET_OK;
 }
 

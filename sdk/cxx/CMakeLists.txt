@@ -9,6 +9,12 @@ set(ASTERNET_CORE_SOURCES
     platform/event_loop.cpp
     platform/log.cpp
     platform/tls.cpp
+    connection/connection_pool.cpp
+    dns/dns_resolver.cpp
+    sdt/quality_prober.cpp
+    orchestrator/interceptor.cpp
+    monitor/metrics.cpp
+    protocol/protocol.cpp
     engine/http1_engine.cpp
     engine/http2_engine.cpp
     engine/protocol_selector.cpp
@@ -24,6 +30,15 @@ else()
     set(ASTERNET_LIB_TYPE STATIC)
 endif()
 add_library(asternet ${ASTERNET_LIB_TYPE} ${ASTERNET_CORE_SOURCES})
+
+# 离线单元测试直接验证内部 C++ 模块。仅静态测试库放宽符号可见性；发布的共享库
+# 继续使用根 CMake 配置的隐藏符号策略。
+if(ASTERNET_BUILD_TESTS AND NOT ASTERNET_SHARED)
+    set_target_properties(asternet PROPERTIES
+        C_VISIBILITY_PRESET default
+        CXX_VISIBILITY_PRESET default
+        VISIBILITY_INLINES_HIDDEN OFF)
+endif()
 
 # 公共头（对外发布，端侧 include 此目录）
 target_include_directories(asternet
@@ -43,11 +58,34 @@ target_include_directories(asternet PRIVATE
     ${NGHTTP2_ROOT}/lib/includes
     ${BSSL_ROOT}/include)
 
+# nghttp2ver.h/config.h 由 nghttp2 的构建过程生成；允许 Android/桌面构建
+# 通过 NGHTTP2_GENERATED_INCLUDE_DIR 指向对应架构的生成目录。
+if(NGHTTP2_GENERATED_INCLUDE_DIR)
+    target_include_directories(asternet PRIVATE ${NGHTTP2_GENERATED_INCLUDE_DIR})
+else()
+    file(GLOB _nghttp2_generated_include_dirs
+         "${NGHTTP2_ROOT}/build*/lib/includes"
+         "${NGHTTP2_ROOT}/build*/")
+    foreach(_dir ${_nghttp2_generated_include_dirs})
+        if(EXISTS "${_dir}/nghttp2/nghttp2ver.h" OR EXISTS "${_dir}/config.h")
+            target_include_directories(asternet PRIVATE "${_dir}")
+        endif()
+    endforeach()
+endif()
+
 if(NOT NGHTTP2_LIB_DIR)
-    set(NGHTTP2_LIB_DIR ${NGHTTP2_ROOT}/build)
+    if(EXISTS "${NGHTTP2_ROOT}/build-android-${ANDROID_ABI}/lib/libnghttp2.a")
+        set(NGHTTP2_LIB_DIR ${NGHTTP2_ROOT}/build-android-${ANDROID_ABI}/lib)
+    else()
+        set(NGHTTP2_LIB_DIR ${NGHTTP2_ROOT}/build)
+    endif()
 endif()
 if(NOT BSSL_LIB_DIR)
-    set(BSSL_LIB_DIR ${BSSL_ROOT}/build)
+    if(EXISTS "${BSSL_ROOT}/build-android-${ANDROID_ABI}/libssl.a")
+        set(BSSL_LIB_DIR ${BSSL_ROOT}/build-android-${ANDROID_ABI})
+    else()
+        set(BSSL_LIB_DIR ${BSSL_ROOT}/build)
+    endif()
 endif()
 
 macro(asternet_add_imported_lib name path)
@@ -83,7 +121,11 @@ if(ASTERNET_ENABLE_XQUIC)
         ${XQUIC_ROOT}/include
         ${XQUIC_ROOT}/third_party/boringssl/include)
     if(NOT XQUIC_LIB_DIR)
-        set(XQUIC_LIB_DIR ${XQUIC_ROOT}/build)
+        if(EXISTS "${XQUIC_ROOT}/build-android-${ANDROID_ABI}/libxquic-static.a")
+            set(XQUIC_LIB_DIR ${XQUIC_ROOT}/build-android-${ANDROID_ABI})
+        else()
+            set(XQUIC_LIB_DIR ${XQUIC_ROOT}/build)
+        endif()
     endif()
     asternet_add_imported_lib(xquic_imp ${XQUIC_LIB_DIR}/libxquic-static.a)
     target_link_libraries(asternet PRIVATE xquic_imp)

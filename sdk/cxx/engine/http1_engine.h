@@ -5,8 +5,8 @@
  *   socket → TLS 握手 → 发请求行+头+body → 读响应（状态行+头+body）
  *   支持 Content-Length 与 Transfer-Encoding: chunked 两种 body 定界。
  *
- * 阶段 1：单请求无连接池（每次新建连接），验证 H1 链路。
- * 后续：Keep-Alive 连接池复用。
+ * 复用单个同 origin 的 Keep-Alive TLS 连接。HTTP/1.1 不支持同连接并发请求，因此
+ * 请求在引擎内串行；网络切换或读写异常会立即淘汰现有连接。
  *
  * 依赖：boringssl 静态库（libssl + libcrypto）。
  */
@@ -15,6 +15,8 @@
 
 #include "engine.h"
 
+#include <memory>
+#include <mutex>
 #include <utility>
 
 namespace asternet {
@@ -22,10 +24,8 @@ namespace engine {
 
 class Http1Engine : public NetworkEngine {
 public:
-    explicit Http1Engine(bool allow_insecure_tls_for_testing, std::string ca_cert_pem = {})
-        : allow_insecure_tls_for_testing_(allow_insecure_tls_for_testing),
-          ca_cert_pem_(std::move(ca_cert_pem)) {}
-    ~Http1Engine() override = default;
+    explicit Http1Engine(bool allow_insecure_tls_for_testing, std::string ca_cert_pem = {});
+    ~Http1Engine() override;
 
     EngineType type() const override { return EngineType::kHttp1; }
     EngineCaps caps() const override {
@@ -35,10 +35,19 @@ public:
     }
 
     int request(const Request &req, Response &resp) override;
+    int prefetch(const std::string &host) override;
+    int migrate_connection() override;
 
 private:
+    struct PooledConnection;
+
+    int ensure_connection(const Request &req, Response &resp, bool &reused);
+    void close_connection();
+
     bool allow_insecure_tls_for_testing_ = false;
     std::string ca_cert_pem_;
+    std::mutex mutex_;
+    std::unique_ptr<PooledConnection> connection_;
 };
 
 }  // namespace engine

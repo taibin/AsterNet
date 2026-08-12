@@ -15,7 +15,7 @@ extern "C" {
 #endif
 
 #define ASTERNET_ABI_VERSION_MAJOR 1
-#define ASTERNET_ABI_VERSION_MINOR 0
+#define ASTERNET_ABI_VERSION_MINOR 1
 #define ASTERNET_ABI_VERSION \
     ((ASTERNET_ABI_VERSION_MAJOR << 16) | ASTERNET_ABI_VERSION_MINOR)
 
@@ -77,6 +77,9 @@ typedef struct {
     int enable_http3;
     int allow_insecure_tls_for_testing;
     const char *ca_cert_pem;
+    // 默认 0：拒绝 RFC1918、loopback、link-local 和 multicast 地址，避免远端配置
+    // 或不可信输入被用作 SSRF 跳板。仅可信内网部署可显式设为 1。
+    int allow_private_networks;
 } asternet_client_config_t;
 
 typedef struct {

@@ -16,6 +16,7 @@
 #define ASTERNET_PROTOCOL_SELECTOR_H
 
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 
@@ -47,11 +48,13 @@ public:
 
 private:
     // 某协议是否对该 host 可用（未熔断）
-    bool is_available(EngineType t, const std::string &host);
+    bool is_available(EngineType t, const Request &request);
     // 记录一次失败
-    void record_failure(EngineType t, const std::string &host);
+    void record_failure(EngineType t, const Request &request);
     // 记录一次成功（清除失败计数）
-    void record_success(EngineType t, const std::string &host);
+    void record_success(EngineType t, const Request &request);
+
+    std::string state_host_key(const Request &request) const;
 
     // host + 引擎类型 → 失败计数与熔断时间
     struct State {
@@ -65,6 +68,7 @@ private:
         }
     };
     std::unordered_map<Key, State, KeyHash> states_;
+    mutable std::mutex states_mutex_;
 
     std::shared_ptr<NetworkEngine> h3_;
     std::shared_ptr<NetworkEngine> h2_;
@@ -72,6 +76,7 @@ private:
 
     int     max_failures_ = 3;       // 连续失败 3 次熔断
     int64_t cooldown_ms_  = 60000;   // 熔断冷却 60s
+    size_t max_states_ = 512;
 
     int64_t now_ms() const;
 };

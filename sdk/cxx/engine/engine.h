@@ -50,6 +50,9 @@ struct Header {
 // 统一请求
 struct Request {
     std::string host;
+    // Optional numeric endpoint selected by the resolver. The logical host remains authoritative
+    // for HTTP Host/:authority, TLS SNI and certificate hostname verification.
+    std::string connect_host;
     uint16_t    port = 443;
     std::string method = "GET";   // GET/POST/PUT/DELETE...
     std::string path = "/";       // 含 query
@@ -57,9 +60,14 @@ struct Request {
     std::vector<Header> headers;  // 自定义头（不含 Host/由引擎注入）
     int         timeout_ms = 15000;
     bool        idempotent = false;
+    // Whether the request may be replayed by retry, address failover or protocol fallback.
+    // This is stricter than HTTP method semantics: writes require a verified idempotency key.
+    bool        retry_safe = false;
     bool        allow_insecure_tls_for_testing = false;
     std::string ca_cert_pem;
     size_t      max_response_body_bytes = 16 * 1024 * 1024;
+    int64_t     dns_ms = -1;
+    uint64_t    network_epoch = 0;
 };
 
 // 统一响应
@@ -75,6 +83,9 @@ struct Response {
     int64_t tls_ms = -1;
     int64_t ttfb_ms = -1;
     int64_t total_ms = -1;
+    bool connection_reused = false;
+    int attempts = 1;
+    std::string failure_stage;
 };
 
 // 传输引擎抽象。各引擎实现 request()，ProtocolSelector 按策略选择引擎调用。
@@ -88,11 +99,14 @@ public:
     // 同步请求：阻塞至完成或超时。返回 ASTERNET_OK 或 asternet_result_t 错误码。
     virtual int request(const Request &req, Response &resp) = 0;
 
-    // 预连接（含 0-RTT），首屏零握手
-    virtual int prefetch(const std::string &host) { (void)host; return 0; }
+    // 未提供持久连接实现的引擎必须明确返回 UNSUPPORTED，不能伪报预连接成功。
+    virtual int prefetch(const std::string &host) {
+        (void)host;
+        return ASTERNET_ERR_UNSUPPORTED;
+    }
 
-    // 触发连接迁移（网络切换时），返回是否成功
-    virtual int migrate_connection() { return 0; }
+    // 同上，只有实际保存连接状态的 QUIC 实现才可迁移。
+    virtual int migrate_connection() { return ASTERNET_ERR_UNSUPPORTED; }
 };
 
 }  // namespace engine

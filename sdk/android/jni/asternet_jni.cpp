@@ -96,8 +96,8 @@ Java_io_asternet_AsterNet_nativeVersion(JNIEnv *env, jclass /*clazz*/) {
 
 JNIEXPORT jlong JNICALL
 Java_io_asternet_AsterNet_nativeCreateClient(JNIEnv *env, jclass /*clazz*/, jint abi_version,
-                                              jboolean enable_h3, jboolean allow_insecure,
-                                              jstring jca_cert_pem) {
+                                               jboolean enable_h3, jboolean allow_insecure,
+                                               jstring jca_cert_pem, jboolean allow_private_networks) {
     UtfChars ca_cert_pem(env, jca_cert_pem);
     asternet_client_config_t config{};
     config.struct_size = sizeof(config);
@@ -107,6 +107,7 @@ Java_io_asternet_AsterNet_nativeCreateClient(JNIEnv *env, jclass /*clazz*/, jint
     config.enable_http3 = enable_h3 ? 1 : 0;
     config.allow_insecure_tls_for_testing = allow_insecure ? 1 : 0;
     config.ca_cert_pem = ca_cert_pem.get();
+    config.allow_private_networks = allow_private_networks ? 1 : 0;
     asternet_result_t error = ASTERNET_OK;
     asternet_client_t *client = asternet_client_create(&config, &error);
     return client == nullptr ? 0 : reinterpret_cast<jlong>(client);
