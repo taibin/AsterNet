@@ -94,6 +94,11 @@ Java_io_asternet_AsterNet_nativeVersion(JNIEnv *env, jclass /*clazz*/) {
     return env->NewStringUTF(asternet_version());
 }
 
+JNIEXPORT jint JNICALL
+Java_io_asternet_AsterNet_nativeAbiVersion(JNIEnv * /*env*/, jclass /*clazz*/) {
+    return ASTERNET_ABI_VERSION;
+}
+
 JNIEXPORT jlong JNICALL
 Java_io_asternet_AsterNet_nativeCreateClient(JNIEnv *env, jclass /*clazz*/, jint abi_version,
                                                jboolean enable_h3, jboolean allow_insecure,
@@ -116,6 +121,23 @@ Java_io_asternet_AsterNet_nativeCreateClient(JNIEnv *env, jclass /*clazz*/, jint
 JNIEXPORT void JNICALL
 Java_io_asternet_AsterNet_nativeDestroyClient(JNIEnv * /*env*/, jclass /*clazz*/, jlong handle) {
     asternet_client_destroy(reinterpret_cast<asternet_client_t *>(handle));
+}
+
+JNIEXPORT jint JNICALL
+Java_io_asternet_AsterNet_nativePrefetch(JNIEnv *env, jclass /*clazz*/, jlong handle,
+                                          jstring jhost) {
+    UtfChars host(env, jhost);
+    if (host.get() == nullptr) {
+        return ASTERNET_ERR_INVALID_ARGUMENT;
+    }
+    return asternet_client_prefetch(reinterpret_cast<asternet_client_t *>(handle), host.get());
+}
+
+JNIEXPORT void JNICALL
+Java_io_asternet_AsterNet_nativeOnNetworkChange(JNIEnv * /*env*/, jclass /*clazz*/, jlong handle,
+                                                jint network) {
+    asternet_client_on_network_change(reinterpret_cast<asternet_client_t *>(handle),
+                                      static_cast<asternet_network_t>(network));
 }
 
 JNIEXPORT jstring JNICALL

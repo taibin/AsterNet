@@ -38,9 +38,14 @@ private:
 };
 
 struct GatewayRequest {
+    std::string host;
+    uint16_t port = 443;
+    std::string method = "POST";
     std::string path;
     std::string body;
     std::vector<engine::Header> headers;
+    asternet_protocol_policy_t policy = ASTERNET_POLICY_AUTO;
+    int timeout_ms = 15000;
     bool idempotent = false;
 };
 

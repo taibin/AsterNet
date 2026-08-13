@@ -1,12 +1,27 @@
 #include "sdt/quality_prober.h"
 
 #include <algorithm>
+#include <chrono>
 #include <mutex>
 #include <sstream>
 #include <utility>
 
 namespace asternet {
 namespace sdt {
+
+namespace {
+
+int64_t monotonic_ms() {
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    return std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+}
+
+void update_loss(QualitySnapshot &snapshot) {
+    snapshot.loss_permil = static_cast<int>(std::min<size_t>(1000,
+        snapshot.total_failures * 1000 / std::max<size_t>(1, snapshot.samples)));
+}
+
+}  // namespace
 
 int compute_score(const QualitySample &sample) {
     if (sample.rtt_ms < 0 && sample.loss_permil < 0 && sample.bandwidth_kbps < 0) return -1;
@@ -69,6 +84,10 @@ void QualityProberImpl::observe_sample(bool success, const QualitySample &sample
     QualitySnapshot &current = state_->snapshot;
     if (!success) {
         ++current.consecutive_failures;
+        ++current.total_failures;
+        ++current.samples;
+        current.last_sample_ms = monotonic_ms();
+        update_loss(current);
         state_->consecutive_good_samples = 0;
         if (current.consecutive_failures >= state_->config.failures_before_bad) {
             current.quality = NetworkQuality::kBad;
@@ -82,6 +101,8 @@ void QualityProberImpl::observe_sample(bool success, const QualitySample &sample
     current.consecutive_failures = 0;
     ++state_->consecutive_good_samples;
     ++current.samples;
+    current.last_sample_ms = monotonic_ms();
+    update_loss(current);
     if (sample.rtt_ms >= 0) {
         current.smoothed_rtt_ms = current.smoothed_rtt_ms < 0
             ? sample.rtt_ms
@@ -91,6 +112,7 @@ void QualityProberImpl::observe_sample(bool success, const QualitySample &sample
 
     QualitySample aggregated = sample;
     if (current.smoothed_rtt_ms >= 0) aggregated.rtt_ms = current.smoothed_rtt_ms;
+    if (current.loss_permil >= 0) aggregated.loss_permil = current.loss_permil;
     if (current.bandwidth_kbps >= 0) aggregated.bandwidth_kbps = current.bandwidth_kbps;
     const int score = compute_score(aggregated);
     if (score >= 0) current.score = score;
@@ -138,8 +160,11 @@ std::string QualityProberImpl::dump() const {
     std::ostringstream out;
     out << "{\"score\":" << current.score << ",\"quality\":"
         << static_cast<int>(current.quality) << ",\"samples\":" << current.samples
-        << ",\"failures\":" << current.consecutive_failures << ",\"network_epoch\":"
-        << current.network_epoch << "}";
+        << ",\"failures\":" << current.consecutive_failures << ",\"total_failures\":"
+        << current.total_failures << ",\"loss_permil\":" << current.loss_permil
+        << ",\"smoothed_rtt_ms\":" << current.smoothed_rtt_ms
+        << ",\"last_sample_ms\":" << current.last_sample_ms
+        << ",\"network_epoch\":" << current.network_epoch << "}";
     return out.str();
 }
 

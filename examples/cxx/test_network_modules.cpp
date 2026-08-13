@@ -59,10 +59,45 @@ void test_dns() {
     auto reordered = resolver.resolve_with_metadata("api.example.test", 1);
     assert(reordered.addresses.size() == 2);
     assert(reordered.addresses.front().ip != "192.0.2.10");
+    auto literal = resolver.resolve_with_metadata("203.0.113.10", 1);
+    assert(literal.error == ASTERNET_OK);
+    assert(literal.addresses.size() == 1);
+
+    auto loopback = resolver.resolve_with_metadata("::ffff:127.0.0.1", 1);
+    assert(loopback.error == ASTERNET_ERR_DNS);
+    auto nat64_loopback = resolver.resolve_with_metadata("64:ff9b::7f00:1", 1);
+    assert(nat64_loopback.error == ASTERNET_ERR_DNS);
+    auto nat64_local_prefix = resolver.resolve_with_metadata("64:ff9b:1:0a00:0001::", 1);
+    assert(nat64_local_prefix.error == ASTERNET_ERR_DNS);
+    auto translated_private = resolver.resolve_with_metadata("::ffff:0:0a00:1", 1);
+    assert(translated_private.error == ASTERNET_ERR_DNS);
+    auto six_to_four_private = resolver.resolve_with_metadata("2002:0a00:0001::1", 1);
+    assert(six_to_four_private.error == ASTERNET_ERR_DNS);
+    auto compatible_loopback = resolver.resolve_with_metadata("::127.0.0.1", 1);
+    assert(compatible_loopback.error == ASTERNET_ERR_DNS);
+    auto compatible_private = resolver.resolve_with_metadata("::10.0.0.1", 1);
+    assert(compatible_private.error == ASTERNET_ERR_DNS);
+
+    SmartDnsResolverImpl fallback_resolver;
+    fallback_resolver.set_backup_ips("blocked.example.test", {{"10.0.0.1"}, {"203.0.113.20"}});
+    auto fallback = fallback_resolver.resolve_with_metadata("blocked.example.test", 1, 1);
+    assert(fallback.error == ASTERNET_OK);
+    assert(fallback.addresses.size() == 1);
+    assert(fallback.addresses.front().ip == "203.0.113.20");
 }
 
 void test_connection_pool() {
     asternet::connection::ConnectionPoolImpl pool(2);
+    int prefetch_calls = 0;
+    int migration_calls = 0;
+    pool.set_prefetch_handler([&prefetch_calls](const std::string &) {
+        ++prefetch_calls;
+        return ASTERNET_OK;
+    });
+    pool.set_migration_handler([&migration_calls] {
+        ++migration_calls;
+        return ASTERNET_ERR_UNSUPPORTED;
+    });
     asternet::connection::Origin origin;
     origin.host = "api.example.test";
     origin.protocol = ASTERNET_PROTOCOL_HTTP_2;
@@ -72,9 +107,15 @@ void test_connection_pool() {
     const auto snapshot = pool.snapshot();
     assert(snapshot.origins == 1);
     assert(snapshot.active_leases == 0);
-    assert(pool.prefetch(origin.host) == ASTERNET_ERR_UNSUPPORTED);
+    assert(pool.prefetch(origin.host) == ASTERNET_OK);
+    assert(prefetch_calls == 1);
     pool.on_network_change(2, ASTERNET_NETWORK_WIFI);
-    assert(pool.snapshot().origins == 0);
+    assert(pool.migrate(ASTERNET_NETWORK_WIFI) == ASTERNET_ERR_UNSUPPORTED);
+    const auto changed = pool.snapshot();
+    assert(changed.origins == 0);
+    assert(changed.evictions >= 1);
+    assert(changed.migrations == 1);
+    assert(migration_calls == 1);
 }
 
 void test_quality() {
@@ -85,6 +126,7 @@ void test_quality() {
     prober.observe(false, -1);
     prober.observe(false, -1);
     assert(prober.is_weak_net());
+    assert(prober.snapshot().loss_permil > 0);
     prober.on_network_change(7, ASTERNET_NETWORK_WIFI);
     assert(prober.snapshot().quality == asternet::sdt::NetworkQuality::kUnknown);
 }
@@ -221,8 +263,10 @@ void test_orchestrator_and_metrics() {
     asternet::monitor::MetricsCollectorImpl collector(2);
     asternet_response_info_t info{};
     info.result = ASTERNET_OK;
+    info.total_ms = 12;
     collector.report(info);
     assert(collector.recent_events().size() == 1);
+    assert(collector.dump().find("avg_total_ms") != std::string::npos);
 }
 
 void test_protocol_codec() {
@@ -233,6 +277,19 @@ void test_protocol_codec() {
     assert(codec.decode(wire.data(), wire.size(), decoded) == ASTERNET_OK);
     assert(decoded == "hello");
     assert(codec.decode(wire.data(), wire.size() - 1, decoded) == ASTERNET_ERR_PROTOCOL);
+
+    asternet::protocol::GatewayRequest gateway;
+    gateway.host = "api.example.test";
+    gateway.method = "POST";
+    gateway.path = "/gateway";
+    gateway.body = "{}";
+    gateway.headers.push_back({"content-type", "application/json"});
+    asternet::engine::Request request;
+    asternet::protocol::DefaultGatewayProtocol protocol;
+    assert(protocol.adapt(gateway, request) == ASTERNET_OK);
+    assert(request.host == gateway.host);
+    assert(request.method == gateway.method);
+    assert(request.path == gateway.path);
 }
 
 }  // namespace

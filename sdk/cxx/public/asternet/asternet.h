@@ -119,6 +119,9 @@ asternet_client_t *asternet_client_create(const asternet_client_config_t *config
 void asternet_client_destroy(asternet_client_t *client);
 void asternet_client_on_network_change(asternet_client_t *client,
                                        asternet_network_t network);
+// Warms DNS for host and attempts transport preconnect when available. Transport preconnect support
+// is best-effort; diagnostics expose the last transport prefetch result.
+asternet_result_t asternet_client_prefetch(asternet_client_t *client, const char *host);
 
 /*
  * Executes a request synchronously.

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <vector>
 #include <sstream>
 
 #include "asternet/version.h"
@@ -55,7 +56,9 @@ bool is_replayable_safe_method(const engine::Request &request) {
 bool Client::check_abi(uint32_t abi_version) {
     const uint32_t expected_major = ASTERNET_ABI_VERSION >> 16;
     const uint32_t got_major = abi_version >> 16;
-    return got_major == expected_major;
+    const uint32_t expected_minor = ASTERNET_ABI_VERSION & 0xffffu;
+    const uint32_t got_minor = abi_version & 0xffffu;
+    return got_major == expected_major && got_minor <= expected_minor;
 }
 
 Client::Client(const asternet_client_config_t &cfg)
@@ -149,6 +152,17 @@ std::string Client::dump_diag() const {
     return out.str();
 }
 
+int Client::prefetch(const std::string &host) {
+    if (host.empty()) return ASTERNET_ERR_INVALID_ARGUMENT;
+    std::shared_lock<std::shared_mutex> lock(lifecycle_mutex_);
+    if (destroyed_.load(std::memory_order_acquire)) return ASTERNET_ERR_CANCELED;
+    int dns_result = ASTERNET_OK;
+    if (dns_resolver_) dns_result = dns_resolver_->prefetch(
+        host, network_epoch_.load(std::memory_order_acquire));
+    if (connection_pool_) (void)connection_pool_->prefetch(host);
+    return dns_result;
+}
+
 int Client::request(const engine::Request &req, engine::Response &resp) {
     return request_with_policy(req, ASTERNET_POLICY_AUTO, resp, nullptr, nullptr);
 }
@@ -202,6 +216,9 @@ int Client::execute_transport(orchestrator::RequestContext &context, engine::Res
 
     const dns::ResolveResult resolution = dns_resolver_->resolve_with_metadata(
         context.request.host, context.network_epoch, context.request.timeout_ms);
+    if (context.attempts <= 1) {
+        context.dns_cache_hit = resolution.cache_hit;
+    }
     response.dns_ms = resolution.elapsed_ms;
     if (resolution.error != ASTERNET_OK || resolution.addresses.empty()) {
         response.err_code = ASTERNET_ERR_DNS;
@@ -263,6 +280,7 @@ void Client::report_metrics(uint64_t request_id, uint64_t network_epoch,
     metrics.network_epoch = network_epoch;
     metrics.attempts = response.attempts;
     metrics.connection_reused = response.connection_reused;
+    metrics.cache_hit = context.dns_cache_hit;
     metrics.deduplicated = context.deduplicated;
     metrics.failure_stage = response.failure_stage;
     metrics_collector_->report_request(metrics);

@@ -37,8 +37,11 @@ struct QualitySnapshot {
     NetworkQuality quality = NetworkQuality::kUnknown;
     size_t samples = 0;
     size_t consecutive_failures = 0;
+    size_t total_failures = 0;
     int smoothed_rtt_ms = -1;
+    int loss_permil = -1;
     int bandwidth_kbps = -1;
+    int64_t last_sample_ms = 0;
     uint64_t network_epoch = 0;
 };
 

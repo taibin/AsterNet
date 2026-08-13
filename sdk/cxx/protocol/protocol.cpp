@@ -40,6 +40,11 @@ int LengthPrefixedCodec::decode(const uint8_t *wire, size_t wire_size, std::stri
 }
 
 int DefaultGatewayProtocol::adapt(const GatewayRequest &input, engine::Request &request) const {
+    if (input.host.empty() || input.host.find_first_of("\r\n") != std::string::npos
+        || input.port == 0 || input.method.empty()
+        || input.method.find_first_of("\r\n ") != std::string::npos) {
+        return ASTERNET_ERR_INVALID_ARGUMENT;
+    }
     if (input.path.empty() || input.path.front() != '/') return ASTERNET_ERR_INVALID_ARGUMENT;
     if (input.path.find('\r') != std::string::npos || input.path.find('\n') != std::string::npos) {
         return ASTERNET_ERR_INVALID_ARGUMENT;
@@ -58,10 +63,14 @@ int DefaultGatewayProtocol::adapt(const GatewayRequest &input, engine::Request &
             return ASTERNET_ERR_INVALID_ARGUMENT;
         }
     }
+    request.host = input.host;
+    request.port = input.port;
+    request.method = input.method;
     request.path = input.path;
     request.body = input.body;
     request.headers = input.headers;
     request.idempotent = input.idempotent;
+    request.timeout_ms = input.timeout_ms > 0 ? input.timeout_ms : 15000;
     return ASTERNET_OK;
 }
 

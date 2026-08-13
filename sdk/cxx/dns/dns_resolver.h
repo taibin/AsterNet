@@ -23,6 +23,7 @@ enum class ResolutionSource {
     kHttpDns,
     kLocalDns,
     kBackup,
+    kLiteral,
 };
 
 // 单个解析结果 IP。score 越高越优；未知 RTT/丢包不会被当作优质链路。
@@ -60,6 +61,10 @@ public:
 
     // 预解析：启动/切前台时对关键域名提前解析并探测，结果入缓存
     virtual int prefetch(const std::string &host) = 0;
+    virtual int prefetch(const std::string &host, uint64_t network_epoch) {
+        (void)network_epoch;
+        return prefetch(host);
+    }
 
     // 清除指定 host 缓存（host 为空则全清）
     virtual void invalidate(const std::string &host = "") = 0;
@@ -98,6 +103,7 @@ public:
                                         uint64_t network_epoch,
                                         int timeout_ms = 0) override;
     int prefetch(const std::string &host) override;
+    int prefetch(const std::string &host, uint64_t network_epoch) override;
     void invalidate(const std::string &host = "") override;
     void report_connection_result(const std::string &host, const std::string &ip,
                                   uint64_t network_epoch, bool success, int rtt_ms) override;

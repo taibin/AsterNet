@@ -8,7 +8,6 @@
 #define ASTERNET_METRICS_H
 
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -42,16 +41,13 @@ public:
 
 class MetricsCollectorImpl final : public MetricsCollector {
 public:
-    using Reporter = std::function<void(const RequestMetrics &)>;
-
-    explicit MetricsCollectorImpl(size_t max_events = 128, Reporter reporter = {});
+    explicit MetricsCollectorImpl(size_t max_events = 128);
     ~MetricsCollectorImpl() override;
 
     void report(const asternet_response_info_t &metrics) override;
     void report_request(const RequestMetrics &metrics) override;
     std::string dump() const override;
     std::vector<RequestMetrics> recent_events() const;
-    void set_reporter(Reporter reporter);
 
 private:
     struct State;

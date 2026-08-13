@@ -3,7 +3,7 @@ package io.asternet;
 import org.json.JSONObject;
 
 public final class AsterNet {
-    public static final int ABI_VERSION = 0x00010000;
+    public static final int ABI_VERSION = 0x00010001;
 
     public static final class Policy {
         public static final int AUTO = 0;
@@ -71,10 +71,18 @@ public final class AsterNet {
         }
 
         public synchronized Response request(String host, int port, String method, String path,
-                                              int policy, String headers, byte[] body, int timeoutMs,
-                                              boolean idempotent, boolean allowInsecure) {
+                                               int policy, String headers, byte[] body, int timeoutMs,
+                                               boolean idempotent, boolean allowInsecure) {
             return requestNative(handle, host, port, method, path, policy, headers, body,
                 timeoutMs, idempotent, allowInsecure);
+        }
+
+        public synchronized int prefetch(String host) {
+            return nativePrefetch(handle, host);
+        }
+
+        public synchronized void onNetworkChange(int network) {
+            nativeOnNetworkChange(handle, network);
         }
 
         @Override
@@ -95,14 +103,17 @@ public final class AsterNet {
     private AsterNet() {}
 
     public static native String nativeVersion();
+    private static native int nativeAbiVersion();
     private static native long nativeCreateClient(int abiVersion, boolean enableH3,
-                                                    boolean allowInsecure, String caCertPem,
-                                                    boolean allowPrivateNetworks);
+                                                     boolean allowInsecure, String caCertPem,
+                                                     boolean allowPrivateNetworks);
     private static native void nativeDestroyClient(long handle);
     private static native String nativeRequest(long handle, String host, int port, String method,
                                                String path, int policy, String headers, byte[] body,
                                                int timeoutMs, boolean idempotent,
                                                boolean allowInsecure);
+    private static native int nativePrefetch(long handle, String host);
+    private static native void nativeOnNetworkChange(long handle, int network);
 
     public static Client createClient(boolean enableH3, String caCertPem) {
         return createClient(enableH3, false, caCertPem);
@@ -114,8 +125,25 @@ public final class AsterNet {
 
     public static Client createClient(boolean enableH3, boolean allowInsecure, String caCertPem,
                                       boolean allowPrivateNetworks) {
-        return new Client(nativeCreateClient(ABI_VERSION, enableH3, allowInsecure, caCertPem,
-            allowPrivateNetworks));
+        ensureCompatibleNative();
+        long handle = nativeCreateClient(ABI_VERSION, enableH3, allowInsecure, caCertPem,
+            allowPrivateNetworks);
+        if (handle == 0L) {
+            throw new IllegalStateException("AsterNet client creation failed");
+        }
+        return new Client(handle);
+    }
+
+    private static void ensureCompatibleNative() {
+        final int nativeAbi;
+        try {
+            nativeAbi = nativeAbiVersion();
+        } catch (LinkageError error) {
+            throw new IllegalStateException("AsterNet native ABI check failed", error);
+        }
+        if ((nativeAbi >>> 16) != (ABI_VERSION >>> 16) || nativeAbi < ABI_VERSION) {
+            throw new IllegalStateException("AsterNet native ABI mismatch: " + nativeAbi);
+        }
     }
 
     private static Response requestNative(long handle, String host, int port, String method,

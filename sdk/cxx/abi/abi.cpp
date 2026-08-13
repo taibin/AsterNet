@@ -94,6 +94,31 @@ bool contains_crlf(const char *value) {
     return value != nullptr && std::strpbrk(value, "\r\n") != nullptr;
 }
 
+bool valid_token(const char *value) {
+    if (value == nullptr || value[0] == '\0') return false;
+    for (const unsigned char *p = reinterpret_cast<const unsigned char *>(value); *p != '\0'; ++p) {
+        if (std::isalnum(*p) || std::strchr("!#$%&'*+-.^_`|~", *p) != nullptr) continue;
+        return false;
+    }
+    return true;
+}
+
+bool valid_path(const char *value) {
+    if (value == nullptr || value[0] != '/') return false;
+    for (const unsigned char *p = reinterpret_cast<const unsigned char *>(value); *p != '\0'; ++p) {
+        if (*p <= 0x20 || *p == 0x7f) return false;
+    }
+    return true;
+}
+
+bool valid_host(const char *value) {
+    if (value == nullptr || value[0] == '\0') return false;
+    for (const unsigned char *p = reinterpret_cast<const unsigned char *>(value); *p != '\0'; ++p) {
+        if (*p <= 0x20 || *p == 0x7f) return false;
+    }
+    return true;
+}
+
 bool valid_header_name(const char *name) {
     if (name == nullptr || name[0] == '\0') return false;
     for (const unsigned char *p = reinterpret_cast<const unsigned char *>(name); *p != '\0'; ++p) {
@@ -236,7 +261,7 @@ ASTERNET_API void asternet_client_destroy(asternet_client_t *client) {
 }
 
 ASTERNET_API void asternet_client_on_network_change(asternet_client_t *client,
-                                                     asternet_network_t network) {
+                                                      asternet_network_t network) {
     try {
         std::shared_ptr<ClientHandle> handle;
         auto owned_client = acquire_client(client, handle);
@@ -248,6 +273,24 @@ ASTERNET_API void asternet_client_on_network_change(asternet_client_t *client,
     }
 }
 
+ASTERNET_API asternet_result_t asternet_client_prefetch(asternet_client_t *client,
+                                                        const char *host) {
+    if (client == nullptr || !valid_host(host)) {
+        return ASTERNET_ERR_INVALID_ARGUMENT;
+    }
+    try {
+        std::shared_ptr<ClientHandle> handle;
+        auto owned_client = acquire_client(client, handle);
+        if (owned_client == nullptr) return ASTERNET_ERR_INVALID_ARGUMENT;
+        ClientLease lease{handle};
+        return static_cast<asternet_result_t>(owned_client->prefetch(host));
+    } catch (const std::bad_alloc &) {
+        return ASTERNET_ERR_OUT_OF_MEMORY;
+    } catch (...) {
+        return ASTERNET_ERR_INTERNAL;
+    }
+}
+
 ASTERNET_API asternet_result_t asternet_client_request_sync(
     asternet_client_t *client, const asternet_request_t *request, uint8_t *out_body,
     size_t out_body_capacity, asternet_response_info_t *out_info) {
@@ -255,9 +298,7 @@ ASTERNET_API asternet_result_t asternet_client_request_sync(
     if (client == nullptr || request == nullptr || request->host == nullptr || request->method == nullptr
         || request->path == nullptr || (request->body_len > 0 && request->body == nullptr)
         || (request->header_count > 0 && request->headers == nullptr)
-        || request->method[0] == '\0' || request->path[0] == '\0'
-        || contains_crlf(request->host) || contains_crlf(request->method)
-        || contains_crlf(request->path)) {
+        || !valid_host(request->host) || !valid_token(request->method) || !valid_path(request->path)) {
         if (out_info != nullptr) out_info->result = ASTERNET_ERR_INVALID_ARGUMENT;
         return ASTERNET_ERR_INVALID_ARGUMENT;
     }

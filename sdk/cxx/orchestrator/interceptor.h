@@ -31,6 +31,7 @@ struct RequestContext {
     int64_t deadline_ms = 0;
     bool weak_network = false;
     bool deduplicated = false;
+    bool dns_cache_hit = false;
 };
 
 using Terminal = std::function<int(RequestContext &, engine::Response &)>;

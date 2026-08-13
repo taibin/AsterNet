@@ -42,6 +42,10 @@ struct PoolSnapshot {
     size_t origins = 0;
     size_t active_leases = 0;
     size_t prefetches = 0;
+    size_t migrations = 0;
+    size_t evictions = 0;
+    int last_prefetch_result = ASTERNET_ERR_UNSUPPORTED;
+    int last_migration_result = ASTERNET_ERR_UNSUPPORTED;
     uint64_t network_epoch = 0;
 };
 

@@ -39,6 +39,10 @@ struct ConnectionPoolImpl::State {
     uint64_t next_lease_id = 1;
     uint64_t network_epoch = 0;
     size_t prefetches = 0;
+    size_t migrations = 0;
+    size_t evictions = 0;
+    int last_prefetch_result = ASTERNET_ERR_UNSUPPORTED;
+    int last_migration_result = ASTERNET_ERR_UNSUPPORTED;
     std::unordered_map<std::string, Entry> entries;
     std::unordered_map<uint64_t, std::string> leases;
     PrefetchHandler prefetch_handler;
@@ -59,20 +63,32 @@ int ConnectionPoolImpl::prefetch(const std::string &host) {
         handler = state_->prefetch_handler;
     }
     // Without a persistent transport implementation, report UNSUPPORTED rather than a fake success.
-    return handler ? handler(host) : ASTERNET_ERR_UNSUPPORTED;
+    const int result = handler ? handler(host) : ASTERNET_ERR_UNSUPPORTED;
+    {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        state_->last_prefetch_result = result;
+    }
+    return result;
 }
 
 int ConnectionPoolImpl::migrate(asternet_network_t /*new_net*/) {
     MigrationHandler handler;
     {
         std::lock_guard<std::mutex> lock(state_->mutex);
+        ++state_->migrations;
         handler = state_->migration_handler;
     }
-    return handler ? handler() : ASTERNET_ERR_UNSUPPORTED;
+    const int result = handler ? handler() : ASTERNET_ERR_UNSUPPORTED;
+    {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        state_->last_migration_result = result;
+    }
+    return result;
 }
 
 void ConnectionPoolImpl::evict_all() {
     std::lock_guard<std::mutex> lock(state_->mutex);
+    state_->evictions += state_->entries.size();
     state_->entries.clear();
     state_->leases.clear();
 }
@@ -90,7 +106,10 @@ ConnectionLease ConnectionPoolImpl::acquire(const Origin &origin) {
                 oldest = it;
             }
         }
-        if (oldest != state_->entries.end()) state_->entries.erase(oldest);
+        if (oldest != state_->entries.end()) {
+            state_->entries.erase(oldest);
+            ++state_->evictions;
+        }
         if (state_->entries.size() >= state_->max_origins) return {};
     }
     State::Entry &entry = state_->entries[key];
@@ -125,6 +144,7 @@ void ConnectionPoolImpl::on_network_change(uint64_t network_epoch, asternet_netw
     std::lock_guard<std::mutex> lock(state_->mutex);
     state_->network_epoch = network_epoch;
     // Existing entries are bound to the preceding network epoch and cannot be reused safely.
+    state_->evictions += state_->entries.size();
     state_->entries.clear();
     state_->leases.clear();
 }
@@ -135,6 +155,10 @@ PoolSnapshot ConnectionPoolImpl::snapshot() const {
     result.origins = state_->entries.size();
     result.active_leases = state_->leases.size();
     result.prefetches = state_->prefetches;
+    result.migrations = state_->migrations;
+    result.evictions = state_->evictions;
+    result.last_prefetch_result = state_->last_prefetch_result;
+    result.last_migration_result = state_->last_migration_result;
     result.network_epoch = state_->network_epoch;
     return result;
 }
@@ -144,6 +168,9 @@ std::string ConnectionPoolImpl::dump() const {
     std::ostringstream out;
     out << "{\"origins\":" << current.origins << ",\"active_leases\":"
         << current.active_leases << ",\"prefetches\":" << current.prefetches
+        << ",\"migrations\":" << current.migrations << ",\"evictions\":"
+        << current.evictions << ",\"last_prefetch_result\":" << current.last_prefetch_result
+        << ",\"last_migration_result\":" << current.last_migration_result
         << ",\"network_epoch\":" << current.network_epoch << "}";
     return out.str();
 }

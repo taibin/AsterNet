@@ -49,6 +49,7 @@ public:
 
     void on_network_change(asternet_network_t net);
     std::string dump_diag() const;
+    int prefetch(const std::string &host);
 
     // 统一请求入口：经 ProtocolSelector 降级链选择引擎（H3→H2→H1.1）。
     int request(const engine::Request &req, engine::Response &resp);

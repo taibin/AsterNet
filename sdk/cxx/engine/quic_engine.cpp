@@ -122,8 +122,8 @@ int QuicEngine::init_engine() {
 }
 
 int QuicEngine::prefetch(const std::string & /*host*/) {
-    // TODO(阶段2): 预建连 + 0-RTT（需 session/tp 持久化）
-    return 0;
+    // TODO(阶段2): 预建连 + 0-RTT（需 session/tp 持久化）。当前不能伪报成功。
+    return ASTERNET_ERR_UNSUPPORTED;
 }
 
 int QuicEngine::migrate_connection() {

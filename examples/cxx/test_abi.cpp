@@ -44,6 +44,11 @@ int main() {
     // 6. 网络变化通知（stub 阶段不应崩溃）
     asternet_client_on_network_change(c, ASTERNET_NETWORK_WIFI);
 
+    // 7. prefetch 入口不应崩溃；物理预连接未实现时必须明确返回 UNSUPPORTED。
+    asternet_result_t prefetch = asternet_client_prefetch(c, "203.0.113.20");
+    assert(prefetch == ASTERNET_OK);
+    assert(asternet_client_prefetch(c, "") == ASTERNET_ERR_INVALID_ARGUMENT);
+
     // destroy 本身幂等，空句柄也应安全处理。
     asternet_client_destroy(c);
     asternet_client_destroy(nullptr);

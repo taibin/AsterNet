@@ -166,6 +166,7 @@ struct RequestCoalescer::State {
         bool complete = false;
         int result = ASTERNET_ERR_INTERNAL;
         engine::Response response;
+        bool dns_cache_hit = false;
     };
 
     std::mutex mutex;
@@ -214,6 +215,7 @@ int RequestCoalescer::execute(RequestContext &context, engine::Response &respons
             return response.err_code;
         }
         response = flight->response;
+        context.dns_cache_hit = flight->dns_cache_hit;
         return flight->result;
     }
 
@@ -230,6 +232,7 @@ int RequestCoalescer::execute(RequestContext &context, engine::Response &respons
         std::lock_guard<std::mutex> lock(state_->mutex);
         flight->result = result;
         flight->response = response;
+        flight->dns_cache_hit = context.dns_cache_hit;
         flight->complete = true;
         state_->flights.erase(key);
     }
