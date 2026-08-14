@@ -4,16 +4,16 @@
 #
 #  ./repack.sh  首次 ~10分钟，之后秒级完成
 #
-#  锁定版本: xquic v1.9.4   nghttp2 v1.70.0
+#  锁定版本: xquic asternet-v1.9.4-h3-cid-fix   nghttp2 v1.70.0
 # ================================================================
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-XQUIC_VERSION="v1.9.4"
+XQUIC_VERSION="asternet-v1.9.4-h3-cid-fix"
 NGHTTP2_VERSION="v1.70.0"
-XQUIC_URL="https://github.com/alibaba/xquic"
+XQUIC_URL="https://github.com/taibin/xquic.git"
 NGHTTP2_URL="https://github.com/nghttp2/nghttp2"
 
 XQUIC_SRC="$SCRIPT_DIR/xquic"
