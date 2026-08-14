@@ -51,7 +51,7 @@ target_include_directories(asternet
 target_compile_features(asternet PUBLIC cxx_std_17)
 
 # ---- 第三方依赖：nghttp2 + boringssl（HTTP/1.1 + HTTP/2 必需）----
-set(THIRD ${CMAKE_SOURCE_DIR}/sdk/third_party)
+get_filename_component(THIRD ${CMAKE_CURRENT_SOURCE_DIR}/../third_party ABSOLUTE)
 set(NGHTTP2_ROOT ${THIRD}/nghttp2)
 set(BSSL_ROOT ${THIRD}/xquic/third_party/boringssl)
 target_include_directories(asternet PRIVATE
@@ -63,9 +63,17 @@ target_include_directories(asternet PRIVATE
 if(NGHTTP2_GENERATED_INCLUDE_DIR)
     target_include_directories(asternet PRIVATE ${NGHTTP2_GENERATED_INCLUDE_DIR})
 else()
-    file(GLOB _nghttp2_generated_include_dirs
-         "${NGHTTP2_ROOT}/build*/lib/includes"
-         "${NGHTTP2_ROOT}/build*/")
+    set(_nghttp2_generated_include_dirs)
+    if(ANDROID_ABI)
+        list(APPEND _nghttp2_generated_include_dirs
+             "${NGHTTP2_ROOT}/build-android-${ANDROID_ABI}/lib/includes"
+             "${NGHTTP2_ROOT}/build-android-${ANDROID_ABI}/lib"
+             "${NGHTTP2_ROOT}/build-android-${ANDROID_ABI}")
+    endif()
+    list(APPEND _nghttp2_generated_include_dirs
+         "${NGHTTP2_ROOT}/build/lib/includes"
+         "${NGHTTP2_ROOT}/build/lib"
+         "${NGHTTP2_ROOT}/build")
     foreach(_dir ${_nghttp2_generated_include_dirs})
         if(EXISTS "${_dir}/nghttp2/nghttp2ver.h" OR EXISTS "${_dir}/config.h")
             target_include_directories(asternet PRIVATE "${_dir}")
@@ -107,6 +115,9 @@ target_link_libraries(asternet PRIVATE ${ASTERNET_THIRD_PARTY_LIBS})
 if(ANDROID)
     target_compile_definitions(asternet PRIVATE ASTERNET_PLATFORM_ANDROID=1)
     target_link_libraries(asternet PRIVATE log)
+    if(ASTERNET_SUPPORT_FLEXIBLE_PAGE_SIZES)
+        target_link_options(asternet PRIVATE -Wl,-z,max-page-size=16384)
+    endif()
 elseif(APPLE)
     target_compile_definitions(asternet PRIVATE ASTERNET_PLATFORM_APPLE=1)
 elseif(UNIX)

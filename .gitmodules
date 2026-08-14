@@ -1,4 +1,6 @@
 [submodule "sdk/third_party/xquic"]
 	path = sdk/third_party/xquic
 	url = https://github.com/taibin/xquic.git
-	branch = asternet-v1.9.4-h3-cid-fix
+[submodule "sdk/third_party/nghttp2"]
+	path = sdk/third_party/nghttp2
+	url = https://github.com/taibin/nghttp2.git

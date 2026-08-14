@@ -4,17 +4,18 @@
 #
 #  ./repack.sh  首次 ~10分钟，之后秒级完成
 #
-#  锁定版本: xquic asternet-v1.9.4-h3-cid-fix   nghttp2 v1.70.0
+#  锁定版本: xquic cdedc53b89b298bec223e3ab998102417a7a6ada   nghttp2 bb16d8c2cadce4eecf1d88fdc5cce6acdb0f6a36
 # ================================================================
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-XQUIC_VERSION="asternet-v1.9.4-h3-cid-fix"
-NGHTTP2_VERSION="v1.70.0"
+XQUIC_VERSION="cdedc53b89b298bec223e3ab998102417a7a6ada"
+NGHTTP2_VERSION="bb16d8c2cadce4eecf1d88fdc5cce6acdb0f6a36"
 XQUIC_URL="https://github.com/taibin/xquic.git"
-NGHTTP2_URL="https://github.com/nghttp2/nghttp2"
+NGHTTP2_URL="https://github.com/taibin/nghttp2.git"
+BSSL_COMMIT="922245af6eda11b3f101ab5f542093eb5e7d1a74"
 
 XQUIC_SRC="$SCRIPT_DIR/xquic"
 NGHTTP2_SRC="$SCRIPT_DIR/nghttp2"
@@ -49,18 +50,21 @@ echo "  CMake: $CMAKE"
 clone_source() {
     local url="$1" dir="$2" version="$3" label="$4"
     if [ -d "$dir/.git" ]; then
-        local cur; cur=$(cd "$dir" && git describe --tags 2>/dev/null || echo "unknown")
-        case "$cur" in *"$version"*) green "  $label: $version ✓"; return ;; esac
-        yellow "  $label: $cur → $version"
-        (cd "$dir" && git fetch --tags 2>/dev/null && git checkout "$version" 2>/dev/null) || true
+        local cur_url cur_ref
+        cur_url=$(cd "$dir" && git remote get-url origin 2>/dev/null || echo "")
+        cur_ref=$(cd "$dir" && git rev-parse HEAD 2>/dev/null || echo "")
+        if [ "$cur_url" = "$url" ] && [ "$cur_ref" = "$version" ]; then
+            green "  $label: $version ✓"
+            return
+        fi
+        yellow "  $label: ${cur_ref:-unknown} → $version"
+        (cd "$dir" && git remote set-url origin "$url" && git fetch origin && git checkout --quiet --detach "$version")
         return
     fi
     [ -d "$dir" ] && rm -rf "$dir"
     echo "  $label: git clone $version ..."
-    git clone --branch "$version" --depth 1 "$url" "$dir" 2>/dev/null || {
-        git clone "$url" "$dir" 2>/dev/null || { red "  clone 失败"; return 1; }
-        (cd "$dir" && git checkout "$version" 2>/dev/null) || true
-    }
+    git clone "$url" "$dir"
+    (cd "$dir" && git checkout --quiet --detach "$version")
     green "  $label: ✓"
 }
 
@@ -70,13 +74,30 @@ download_all() {
     clone_source "$XQUIC_URL"   "$XQUIC_SRC"   "$XQUIC_VERSION"   "xquic"
     clone_source "$NGHTTP2_URL" "$NGHTTP2_SRC" "$NGHTTP2_VERSION" "nghttp2"
 
-    # BoringSSL：xquic v1.9.4 没有用 git submodule 管理，需单独放置
+    # BoringSSL 由 xquic 仓库提供，并固定到已验证的提交。
+    if [ -d "$BSSL_SRC/.git" ]; then
+        local cur_bssl
+        cur_bssl=$(cd "$BSSL_SRC" && git rev-parse HEAD)
+        if [ "$cur_bssl" != "$BSSL_COMMIT" ]; then
+            yellow "  boringssl: $cur_bssl → $BSSL_COMMIT"
+            (cd "$BSSL_SRC" && git checkout --quiet "$BSSL_COMMIT")
+        fi
+        printf '%s\n' "$BSSL_COMMIT" > "$BSSL_SRC/.commit"
+    fi
     if [ ! -f "$BSSL_SRC/CMakeLists.txt" ]; then
-        echo "  boringssl: git clone ..."
-        rm -rf "$BSSL_SRC"
-        git clone --depth 1 https://github.com/google/boringssl "$BSSL_SRC" 2>/dev/null || {
-            red "  boringssl: clone 失败，请手动 git clone 到 $BSSL_SRC"; return 1;
-        }
+        red "  boringssl: 缺失，请先确保 xquic 仓库中的 third_party/boringssl 已就绪"
+        return 1
+    fi
+    if [ -f "$BSSL_SRC/.commit" ]; then
+        local bssl_source_recorded
+        bssl_source_recorded=$(<"$BSSL_SRC/.commit")
+        if [ "$bssl_source_recorded" != "$BSSL_COMMIT" ]; then
+            red "  boringssl: 源码提交不匹配"
+            return 1
+        fi
+    else
+        red "  boringssl: 缺少提交标记"
+        return 1
     fi
     green "  boringssl: ✓"
 }
@@ -115,39 +136,31 @@ build_all() {
 
     # 1. BoringSSL
     local bssl_out="$BSSL_SRC/build-android-$ABI"
-    if [ ! -f "$bssl_out/libcrypto.a" ]; then
-        run_cmake "$BSSL_SRC" "$bssl_out" "boringssl" \
-            -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF
-        [ ! -f "$bssl_out/libcrypto.a" ] && { red "  libcrypto.a 未产出"; return 1; }
-    else
-        green "  boringssl: ✓"
-    fi
+    run_cmake "$BSSL_SRC" "$bssl_out" "boringssl" \
+        -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF
+    [ ! -f "$bssl_out/libcrypto.a" ] && { red "  libcrypto.a 未产出"; return 1; }
+    printf '%s\n' "$BSSL_COMMIT" > "$BSSL_SRC/.commit"
+    printf '%s\n' "$BSSL_COMMIT" > "$bssl_out/.commit"
 
     # 2. xquic
     local xq_out="$XQUIC_SRC/build-android-$ABI"
-    if [ ! -f "$xq_out/libxquic-static.a" ]; then
-        run_cmake "$XQUIC_SRC" "$xq_out" "xquic" \
-            -DBUILD_SHARED_LIBS=OFF \
-            -DSSL_TYPE=boringssl \
-            -DSSL_PATH="$BSSL_SRC" \
-            -DSSL_INCLUDE_DIR="$BSSL_SRC/include" \
-            -DSSL_LIBRARY_STATIC="$bssl_out/libssl.a" \
-            -DCRYPTO_LIBRARY_STATIC="$bssl_out/libcrypto.a"
-        [ ! -f "$xq_out/libxquic-static.a" ] && { red "  libxquic-static.a 未产出"; return 1; }
-    else
-        green "  xquic: ✓"
-    fi
+    run_cmake "$XQUIC_SRC" "$xq_out" "xquic" \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DSSL_TYPE=boringssl \
+        -DSSL_PATH="$BSSL_SRC" \
+        -DSSL_INCLUDE_DIR="$BSSL_SRC/include" \
+        -DSSL_LIBRARY_STATIC="$bssl_out/libssl.a" \
+        -DCRYPTO_LIBRARY_STATIC="$bssl_out/libcrypto.a"
+    [ ! -f "$xq_out/libxquic-static.a" ] && { red "  libxquic-static.a 未产出"; return 1; }
+    printf '%s\n' "$XQUIC_VERSION" > "$xq_out/.commit"
 
     # 3. nghttp2
     local ng_out="$NGHTTP2_SRC/build-android-$ABI"
-    if [ ! -f "$ng_out/lib/libnghttp2.a" ]; then
-        run_cmake "$NGHTTP2_SRC" "$ng_out" "nghttp2" \
-            -DENABLE_LIB_ONLY=ON -DBUILD_STATIC_LIBS=ON \
-            -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF
-        [ ! -f "$ng_out/lib/libnghttp2.a" ] && { red "  libnghttp2.a 未产出"; return 1; }
-    else
-        green "  nghttp2: ✓"
-    fi
+    run_cmake "$NGHTTP2_SRC" "$ng_out" "nghttp2" \
+        -DENABLE_LIB_ONLY=ON -DBUILD_STATIC_LIBS=ON \
+        -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF
+    [ ! -f "$ng_out/lib/libnghttp2.a" ] && { red "  libnghttp2.a 未产出"; return 1; }
+    printf '%s\n' "$NGHTTP2_VERSION" > "$ng_out/.commit"
 }
 
 # ---- .a → .so ----
