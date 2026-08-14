@@ -1,4 +1,4 @@
-// AsterNet Android SDK — 产出 AAR（包含 libasternet-jni.so + libasternet.so + 三方 .so）
+// AsterNet Android SDK — 产出 AAR（包含 16KB 对齐的 libasternet-jni.so + libasternet.so）
 plugins {
     id 'com.android.library'
 }
@@ -17,6 +17,7 @@ android {
                 cppFlags '-std=c++17 -O2 -fexceptions'
                 arguments '-DCMAKE_BUILD_TYPE=Release',
                           '-DASTERNET_ENABLE_XQUIC=ON',
+                          '-DASTERNET_SUPPORT_FLEXIBLE_PAGE_SIZES=ON',
                           '-DASTERNET_SHARED=ON'
             }
         }
@@ -32,6 +33,12 @@ android {
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_1_8
         targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    packaging {
+        jniLibs {
+            excludes += ['**/libc++_shared.so']
+        }
     }
 }
 

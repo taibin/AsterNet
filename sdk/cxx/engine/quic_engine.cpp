@@ -61,6 +61,46 @@ bool parse_http_status(const xqc_http_header_t &header, int *status) {
     *status = parsed;
     return true;
 }
+
+const char *quic_error_name(int err) {
+    switch (err) {
+    case 0: return "NO_ERROR";
+    case TRA_INTERNAL_ERROR: return "TRA_INTERNAL_ERROR";
+    case TRA_CONNECTION_REFUSED_ERROR: return "TRA_CONNECTION_REFUSED_ERROR";
+    case TRA_FLOW_CONTROL_ERROR: return "TRA_FLOW_CONTROL_ERROR";
+    case TRA_STREAM_LIMIT_ERROR: return "TRA_STREAM_LIMIT_ERROR";
+    case TRA_STREAM_STATE_ERROR: return "TRA_STREAM_STATE_ERROR";
+    case TRA_FINAL_SIZE_ERROR: return "TRA_FINAL_SIZE_ERROR";
+    case TRA_FRAME_ENCODING_ERROR: return "TRA_FRAME_ENCODING_ERROR";
+    case TRA_TRANSPORT_PARAMETER_ERROR: return "TRA_TRANSPORT_PARAMETER_ERROR";
+    case TRA_CONNECTION_ID_LIMIT_ERROR: return "TRA_CONNECTION_ID_LIMIT_ERROR";
+    case TRA_PROTOCOL_VIOLATION: return "TRA_PROTOCOL_VIOLATION";
+    case TRA_INVALID_TOKEN: return "TRA_INVALID_TOKEN";
+    case TRA_APPLICATION_ERROR: return "TRA_APPLICATION_ERROR";
+    case TRA_CRYPTO_BUFFER_EXCEEDED: return "TRA_CRYPTO_BUFFER_EXCEEDED";
+    case TRA_0RTT_TRANS_PARAMS_ERROR: return "TRA_0RTT_TRANS_PARAMS_ERROR";
+    case TRA_VERSION_NEGOTIATION_ERROR: return "TRA_VERSION_NEGOTIATION_ERROR";
+    case TRA_NO_APPLICATION_PROTOCOL: return "TRA_NO_APPLICATION_PROTOCOL";
+    case H3_NO_ERROR: return "H3_NO_ERROR_OR_CRYPTO_ERROR_BASE";
+    case H3_GENERAL_PROTOCOL_ERROR: return "H3_GENERAL_PROTOCOL_ERROR_OR_CRYPTO_ERROR";
+    case H3_INTERNAL_ERROR: return "H3_INTERNAL_ERROR_OR_CRYPTO_ERROR";
+    case H3_STREAM_CREATION_ERROR: return "H3_STREAM_CREATION_ERROR_OR_CRYPTO_ERROR";
+    case H3_CLOSED_CRITICAL_STREAM: return "H3_CLOSED_CRITICAL_STREAM_OR_CRYPTO_ERROR";
+    case H3_FRAME_UNEXPECTED: return "H3_FRAME_UNEXPECTED_OR_CRYPTO_ERROR";
+    case H3_FRAME_ERROR: return "H3_FRAME_ERROR_OR_CRYPTO_ERROR";
+    case H3_EXCESSIVE_LOAD: return "H3_EXCESSIVE_LOAD_OR_CRYPTO_ERROR";
+    case H3_ID_ERROR: return "H3_ID_ERROR_OR_CRYPTO_ERROR";
+    case H3_SETTINGS_ERROR: return "H3_SETTINGS_ERROR_OR_CRYPTO_ERROR";
+    case H3_MISSING_SETTINGS: return "H3_MISSING_SETTINGS_OR_CRYPTO_ERROR";
+    case H3_REQUEST_REJECTED: return "H3_REQUEST_REJECTED_OR_CRYPTO_ERROR";
+    case H3_REQUEST_CANCELLED: return "H3_REQUEST_CANCELLED_OR_CRYPTO_ERROR";
+    case H3_REQUEST_INCOMPLETE: return "H3_REQUEST_INCOMPLETE_OR_CRYPTO_ERROR";
+    case H3_MESSAGE_ERROR: return "H3_MESSAGE_ERROR_OR_CRYPTO_ERROR";
+    case H3_CONNECT_ERROR: return "H3_CONNECT_ERROR_OR_CRYPTO_ERROR";
+    case H3_VERSION_FALLBACK: return "H3_VERSION_FALLBACK_OR_CRYPTO_ERROR";
+    default: return "UNKNOWN";
+    }
+}
 }  // namespace
 
 QuicEngine::QuicEngine(bool allow_insecure_tls_for_testing, std::string ca_cert_pem)
@@ -327,6 +367,17 @@ int QuicEngine::request(const Request &req, Response &resp) {
 
     // 7. 收集结果
     RequestContext &ctx = *cur_req_;
+    if (engine_ != nullptr) {
+        const xqc_conn_stats_t conn_stats = xqc_conn_get_stats(engine_, &ctx.cid);
+        ctx.conn_error = conn_stats.conn_err;
+        ctx.packets_sent = conn_stats.send_count;
+        ctx.packets_received = conn_stats.recv_count;
+        ctx.packets_lost = conn_stats.lost_count;
+        ctx.srtt_us = conn_stats.srtt;
+        if (ctx.stream_error == 0 && conn_stats.conn_err != 0) {
+            ctx.stream_error = conn_stats.conn_err;
+        }
+    }
     resp.http_status = ctx.http_status;
     resp.ttfb_ms = ctx.ttfb_ms;
     resp.total_ms = monotonic_ms() - request_start_ms;
@@ -366,9 +417,12 @@ int QuicEngine::request(const Request &req, Response &resp) {
     loop_->remove_fd(sock_fd);
     close(sock_fd);
 
-    ASTER_LOG_INFO("asternet-h3", "<== ret=%d status=%d body_len=%zu ttfb_ms=%lld total_ms=%lld stream_err=%d",
+    ASTER_LOG_INFO("asternet-h3", "<== ret=%d status=%d body_len=%zu ttfb_ms=%lld total_ms=%lld stream_err=%d(%s) conn_err=%d(%s) sent=%u recv=%u lost=%u srtt_us=%llu",
                ret, resp.http_status, body_len, static_cast<long long>(resp.ttfb_ms),
-               static_cast<long long>(resp.total_ms), ctx.stream_error);
+               static_cast<long long>(resp.total_ms), ctx.stream_error,
+               quic_error_name(ctx.stream_error), ctx.conn_error, quic_error_name(ctx.conn_error),
+               ctx.packets_sent, ctx.packets_received, ctx.packets_lost,
+               static_cast<unsigned long long>(ctx.srtt_us));
     cur_req_.reset();
     return ret;
 }
@@ -566,7 +620,8 @@ int QuicEngine::h3_conn_close_notify_cb(xqc_h3_conn_t *h3_conn, const xqc_cid_t 
         && !self->cur_req_->finished.load()) {
         const xqc_int_t err = xqc_h3_conn_get_errno(h3_conn);
         self->cur_req_->stream_error = err;
-        ASTER_LOG_WARN("asternet-h3", "H3 connection closed before response completion err=%d", err);
+        ASTER_LOG_WARN("asternet-h3", "H3 connection closed before response completion err=%d(%s)",
+                       err, quic_error_name(err));
         self->cur_req_->failed.store(true);
     }
     return XQC_OK;
@@ -689,7 +744,8 @@ void QuicEngine::h3_request_closing_notify_cb(xqc_h3_request_t * /*req*/, xqc_in
     if (self != nullptr && self->cur_req_ != nullptr && !self->cur_req_->cleanup_started.load()
         && !self->cur_req_->finished.load()) {
         self->cur_req_->stream_error = err;
-        ASTER_LOG_WARN("asternet-h3", "H3 request reset by peer err=%d", err);
+        ASTER_LOG_WARN("asternet-h3", "H3 request reset by peer err=%d(%s)",
+                       err, quic_error_name(err));
         self->cur_req_->failed.store(true);
     }
 }
@@ -703,8 +759,9 @@ int QuicEngine::h3_request_close_notify_cb(xqc_h3_request_t *req, void *user_dat
     const xqc_request_stats_t stats = xqc_h3_request_get_stats(req);
     ctx.stream_error = stats.stream_err;
     if (stats.stream_err != 0 || !ctx.response_fin.load() || !ctx.got_status.load()) {
-        ASTER_LOG_WARN("asternet-h3", "H3 request closed incomplete fin=%d status=%d stream_err=%d",
-                   ctx.response_fin.load(), ctx.got_status.load(), stats.stream_err);
+        ASTER_LOG_WARN("asternet-h3", "H3 request closed incomplete fin=%d status=%d stream_err=%d(%s)",
+                   ctx.response_fin.load(), ctx.got_status.load(), stats.stream_err,
+                   quic_error_name(stats.stream_err));
         ctx.failed.store(true);
     } else {
         complete_response_if_ready(ctx);

@@ -70,6 +70,11 @@ private:
         int         sock_fd = -1;
         int         http_status = 0;
         int         stream_error = 0;
+        int         conn_error = 0;
+        uint32_t    packets_sent = 0;
+        uint32_t    packets_received = 0;
+        uint32_t    packets_lost = 0;
+        xqc_usec_t  srtt_us = 0;
         int64_t     start_ms = 0;
         int64_t     ttfb_ms = -1;
         size_t      request_body_sent = 0;

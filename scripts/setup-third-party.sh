@@ -16,6 +16,7 @@ set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 THIRD="$ROOT/sdk/third_party"
 ABI="arm64-v8a"
+BUILD_DIR="build-android-$ABI"
 BASE_URL="https://github.com/YOUR_ORG/asternet/releases/download/libs-v1"
 
 # ---- 颜色 ----
@@ -114,17 +115,17 @@ verify_all() {
 
     check "xquic/include"
     check "xquic/third_party/boringssl/include"
-    check "xquic/build-android-arm64/libxquic-static.a"
-    check "xquic/third_party/boringssl/build-android-arm64/libssl.a"
-    check "xquic/third_party/boringssl/build-android-arm64/libcrypto.a"
-    check "nghttp2/build-android-arm64/libnghttp2.a"
+    check "xquic/$BUILD_DIR/libxquic-static.a"
+    check "xquic/third_party/boringssl/$BUILD_DIR/libssl.a"
+    check "xquic/third_party/boringssl/$BUILD_DIR/libcrypto.a"
+    check "nghttp2/$BUILD_DIR/lib/libnghttp2.a"
     check "nghttp2/lib/includes"
 
     if [ "$miss" -eq 0 ]; then
         echo ""
         green "═══════════════════════════════════════"
         green "  第三方依赖就绪"
-        green "  ./gradlew :demo-app:assembleDebug"
+        green "  ./gradlew :examples:android:assembleDebug"
         green "═══════════════════════════════════════"
     else
         echo ""
@@ -145,16 +146,16 @@ if [ "$MODE" = "local" ]; then
 
     copy_one "$LOCAL_XQUIC/include"                       "$THIRD/xquic/include"                        "xquic headers"
     copy_one "$LOCAL_XQUIC/third_party/boringssl/include" "$THIRD/xquic/third_party/boringssl/include"  "boringssl headers"
-    copy_one "$LOCAL_XQUIC/build-android-arm64/libxquic-static.a" \
-             "$THIRD/xquic/build-android-arm64/libxquic-static.a"   "libxquic-static.a"
-    copy_one "$LOCAL_XQUIC/third_party/boringssl/build-android-arm64/libssl.a" \
-             "$THIRD/xquic/third_party/boringssl/build-android-arm64/libssl.a"   "libssl.a"
-    copy_one "$LOCAL_XQUIC/third_party/boringssl/build-android-arm64/libcrypto.a" \
-             "$THIRD/xquic/third_party/boringssl/build-android-arm64/libcrypto.a" "libcrypto.a"
+    copy_one "$LOCAL_XQUIC/$BUILD_DIR/libxquic-static.a" \
+             "$THIRD/xquic/$BUILD_DIR/libxquic-static.a"   "libxquic-static.a"
+    copy_one "$LOCAL_XQUIC/third_party/boringssl/$BUILD_DIR/libssl.a" \
+             "$THIRD/xquic/third_party/boringssl/$BUILD_DIR/libssl.a"   "libssl.a"
+    copy_one "$LOCAL_XQUIC/third_party/boringssl/$BUILD_DIR/libcrypto.a" \
+             "$THIRD/xquic/third_party/boringssl/$BUILD_DIR/libcrypto.a" "libcrypto.a"
 
     if [ -n "$LOCAL_NGHTTP2" ]; then
-        copy_one "$LOCAL_NGHTTP2/build-android-arm64/libnghttp2.a" \
-                 "$THIRD/nghttp2/build-android-arm64/libnghttp2.a"  "libnghttp2.a"
+        copy_one "$LOCAL_NGHTTP2/$BUILD_DIR/lib/libnghttp2.a" \
+                 "$THIRD/nghttp2/$BUILD_DIR/lib/libnghttp2.a"  "libnghttp2.a"
     fi
 
     verify_all
@@ -175,13 +176,13 @@ else
 
     # 静态库
     download_one "$BASE_URL/libxquic-static-${ABI}.a" \
-                 "$THIRD/xquic/build-android-arm64/libxquic-static.a"   "libxquic-static.a"
+                 "$THIRD/xquic/$BUILD_DIR/libxquic-static.a"   "libxquic-static.a"
     download_one "$BASE_URL/libssl-${ABI}.a" \
-                 "$THIRD/xquic/third_party/boringssl/build-android-arm64/libssl.a"  "libssl.a"
+                 "$THIRD/xquic/third_party/boringssl/$BUILD_DIR/libssl.a"  "libssl.a"
     download_one "$BASE_URL/libcrypto-${ABI}.a" \
-                 "$THIRD/xquic/third_party/boringssl/build-android-arm64/libcrypto.a" "libcrypto.a"
+                 "$THIRD/xquic/third_party/boringssl/$BUILD_DIR/libcrypto.a" "libcrypto.a"
     download_one "$BASE_URL/libnghttp2-${ABI}.a" \
-                 "$THIRD/nghttp2/build-android-arm64/libnghttp2.a"       "libnghttp2.a"
+                 "$THIRD/nghttp2/$BUILD_DIR/lib/libnghttp2.a"       "libnghttp2.a"
 
     verify_all
 fi

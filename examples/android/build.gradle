@@ -24,8 +24,7 @@ android {
                 arguments '-DCMAKE_BUILD_TYPE=Release',
                           '-DASTERNET_ENABLE_XQUIC=ON',
                           '-DASTERNET_SUPPORT_FLEXIBLE_PAGE_SIZES=ON',
-                          '-DXQUIC_LIB_DIR=' + rootProject.projectDir.absolutePath + '/sdk/third_party/xquic/build-android-arm64-v8a',
-                          '-DASTERNET_SHARED=ON'
+                          '-DXQUIC_LIB_DIR=' + rootProject.projectDir.absolutePath + '/sdk/third_party/xquic/build-android-arm64-v8a'
             }
         }
     }
@@ -45,7 +44,12 @@ android {
 
     sourceSets {
         main.java.srcDirs += ['../../sdk/android/src/main/java']
-        main.jniLibs.srcDirs += ['../../sdk/third_party/libs']
+    }
+
+    packaging {
+        jniLibs {
+            excludes += ['**/libc++_shared.so']
+        }
     }
 
     compileOptions {

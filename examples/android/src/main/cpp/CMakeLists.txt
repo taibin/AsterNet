@@ -1,5 +1,5 @@
 # AsterNet Android Example CMake
-# 编译 libasternet-jni.so（静态链接三方库，独立 .so 由 jniLibs 打包）
+# 编译 libasternet-jni.so；三方依赖静态链接进 JNI so，避免打包未对齐的预编译 so。
 cmake_minimum_required(VERSION 3.18)
 project(asternet-example-android C CXX)
 
