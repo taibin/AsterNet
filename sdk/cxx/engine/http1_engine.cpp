@@ -2,7 +2,7 @@
  * AsterNet 网络核心 —— HTTP/1.1 引擎实现（自研，boringssl TLS）
  *
  * 流程：DNS → TCP socket → TLS 握手 → 发请求 → 读响应（Content-Length / chunked）。
- * POC：证书校验跳过（生产必须校验），无 Keep-Alive 连接池（每次新建连接）。
+ * 当前支持同 origin Keep-Alive 复用；网络切换或读写异常会立即淘汰现有连接。
  */
 #include "engine/http1_engine.h"
 
@@ -110,6 +110,7 @@ struct Http1Engine::PooledConnection {
     std::string endpoint;
     uint16_t port = 0;
     std::string ca_cert_pem;
+    uint64_t network_epoch = 0;
     bool allow_insecure = false;
 };
 
@@ -140,6 +141,7 @@ int Http1Engine::ensure_connection(const Request &req, Response &resp, bool &reu
     const std::string ca_bundle = req.ca_cert_pem.empty() ? ca_cert_pem_ : req.ca_cert_pem;
     if (connection_ && connection_->host == req.host && connection_->endpoint == endpoint
         && connection_->port == req.port && connection_->ca_cert_pem == ca_bundle
+        && connection_->network_epoch == req.network_epoch
         && connection_->allow_insecure == allow_insecure) {
         reused = true;
         return ASTERNET_OK;
@@ -196,6 +198,7 @@ int Http1Engine::ensure_connection(const Request &req, Response &resp, bool &reu
     connection_->endpoint = endpoint;
     connection_->port = req.port;
     connection_->ca_cert_pem = ca_bundle;
+    connection_->network_epoch = req.network_epoch;
     connection_->allow_insecure = allow_insecure;
     return ASTERNET_OK;
 }
@@ -220,6 +223,18 @@ int Http1Engine::request(const Request &req, Response &resp) {
     resp.connection_reused = reused;
     SSL *ssl = connection_->ssl;
 
+    auto has_crlf = [](const std::string &s) {
+        return s.find_first_of("\r\n") != std::string::npos;
+    };
+    if (has_crlf(req.host) || has_crlf(req.connect_host) || has_crlf(req.method)
+        || has_crlf(req.path)) {
+        close_connection();
+        resp.err_code = ASTERNET_ERR_PROTOCOL;
+        resp.failure_stage = "header";
+        resp.total_ms = monotonic_ms() - t_start;
+        return ASTERNET_ERR_PROTOCOL;
+    }
+
     // 3. 构造请求
     // Host 头：非默认端口需显式携带端口号（RFC 7230）
     std::string host_hdr = req.host;
@@ -229,13 +244,47 @@ int Http1Engine::request(const Request &req, Response &resp) {
     std::string req_str = req.method + " " + req.path + " HTTP/1.1\r\n";
     req_str += "Host: " + host_hdr + "\r\n";
     req_str += "User-Agent: asternet/0.1\r\n";
-    req_str += "Connection: close\r\n";
+    req_str += "Connection: keep-alive\r\n";
     bool has_body = !req.body.empty();
     if (has_body) {
         req_str += "Content-Length: " + std::to_string(req.body.size()) + "\r\n";
     }
+    auto append_custom_header = [&](const Header &h) -> bool {
+        const std::string name = h.name;
+        const std::string value = h.value;
+        if (name.find_first_of("\r\n") != std::string::npos
+            || value.find_first_of("\r\n") != std::string::npos) {
+            return false;
+        }
+        if (name.empty()) return false;
+        for (unsigned char c : name) {
+            const bool alnum = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z')
+                || (c >= 'a' && c <= 'z');
+            const bool token = alnum || c == '!' || c == '#' || c == '$' || c == '%'
+                || c == '&' || c == '\'' || c == '*' || c == '+' || c == '-'
+                || c == '.' || c == '^' || c == '_' || c == '`' || c == '|'
+                || c == '~';
+            if (!token) return false;
+        }
+        std::string lower_name;
+        lower_name.reserve(name.size());
+        for (char c : name) lower_name += static_cast<char>(tolower(static_cast<unsigned char>(c)));
+        if (lower_name == "host" || lower_name == "connection" || lower_name == "content-length"
+            || lower_name == "transfer-encoding" || lower_name == "keep-alive"
+            || lower_name == "proxy-connection" || lower_name == "upgrade") {
+            return true;
+        }
+        req_str += name + ": " + value + "\r\n";
+        return true;
+    };
     for (const auto &h : req.headers) {
-        req_str += h.name + ": " + h.value + "\r\n";
+        if (!append_custom_header(h)) {
+            close_connection();
+            resp.err_code = ASTERNET_ERR_PROTOCOL;
+            resp.failure_stage = "header";
+            resp.total_ms = monotonic_ms() - t_start;
+            return ASTERNET_ERR_PROTOCOL;
+        }
     }
     req_str += "\r\n";
     if (has_body) req_str += req.body;
@@ -276,13 +325,33 @@ int Http1Engine::request(const Request &req, Response &resp) {
     }
     resp.ttfb_ms = monotonic_ms() - first_byte_start;
 
-    // 解析状态行
-    size_t sp1 = raw.find(' ');
-    if (sp1 != std::string::npos) {
-        size_t sp2 = raw.find(' ', sp1 + 1);
-        if (sp2 != std::string::npos) {
-            resp.http_status = atoi(raw.c_str() + sp1 + 1);
+    auto parse_status = [&]() {
+        size_t sp1 = raw.find(' ');
+        if (sp1 != std::string::npos) {
+            size_t sp2 = raw.find(' ', sp1 + 1);
+            if (sp2 != std::string::npos) {
+                resp.http_status = atoi(raw.c_str() + sp1 + 1);
+            }
         }
+    };
+    parse_status();
+    while (resp.http_status / 100 == 1) {
+        raw.erase(0, header_end + 4);
+        header_end = raw.find("\r\n\r\n");
+        while (header_end == std::string::npos && raw.size() <= kMaxResponseHeaders) {
+            ssize_t r = SSL_read(ssl, buf, sizeof(buf));
+            if (r <= 0) break;
+            raw.append(buf, r);
+            header_end = raw.find("\r\n\r\n");
+        }
+        if (header_end == std::string::npos || raw.size() > kMaxResponseHeaders) {
+            close_connection();
+            resp.err_code = ASTERNET_ERR_PROTOCOL;
+            resp.failure_stage = "ttfb";
+            resp.total_ms = monotonic_ms() - t_start;
+            return ASTERNET_ERR_PROTOCOL;
+        }
+        parse_status();
     }
 
     // 判断 body 定界
@@ -291,18 +360,79 @@ int Http1Engine::request(const Request &req, Response &resp) {
     lower.reserve(headers.size());
     for (char c : headers) lower += (char)tolower(c);
 
-    bool chunked = lower.find("transfer-encoding: chunked") != std::string::npos;
+    bool chunked = false;
+    bool connection_close = false;
     size_t cl = std::string::npos;
-    {
-        size_t p = lower.find("content-length:");
-        if (p != std::string::npos) {
-            cl = atoi(headers.c_str() + p + strlen("content-length:"));
+    bool invalid_response_headers = false;
+    size_t line_start = 0;
+    while (line_start < headers.size()) {
+        size_t line_end = headers.find("\r\n", line_start);
+        if (line_end == std::string::npos) line_end = headers.size();
+        const std::string line = headers.substr(line_start, line_end - line_start);
+        const size_t colon = line.find(':');
+        if (colon != std::string::npos) {
+            std::string name = line.substr(0, colon);
+            std::string value = line.substr(colon + 1);
+            while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
+                value.erase(value.begin());
+            }
+            while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) {
+                value.pop_back();
+            }
+            std::string lower_name;
+            lower_name.reserve(name.size());
+            for (char c : name) lower_name += static_cast<char>(tolower(static_cast<unsigned char>(c)));
+            std::string lower_value;
+            lower_value.reserve(value.size());
+            for (char c : value) lower_value += static_cast<char>(tolower(static_cast<unsigned char>(c)));
+            if (lower_name == "transfer-encoding" && lower_value.find("chunked") != std::string::npos) {
+                chunked = true;
+            } else if (lower_name == "connection" && lower_value.find("close") != std::string::npos) {
+                connection_close = true;
+            } else if (lower_name == "content-length") {
+                if (value.empty()) {
+                    invalid_response_headers = true;
+                } else {
+                    char *end = nullptr;
+                    errno = 0;
+                    unsigned long long parsed = strtoull(value.c_str(), &end, 10);
+                    while (end != nullptr && (*end == ' ' || *end == '\t')) ++end;
+                    if (errno != 0 || end == nullptr || *end != '\0'
+                        || parsed > static_cast<unsigned long long>(SIZE_MAX)) {
+                        invalid_response_headers = true;
+                    } else if (cl != std::string::npos && cl != static_cast<size_t>(parsed)) {
+                        invalid_response_headers = true;
+                    } else {
+                        cl = static_cast<size_t>(parsed);
+                    }
+                }
+            }
         }
+        if (line_end == headers.size()) break;
+        line_start = line_end + 2;
+    }
+    if (invalid_response_headers) {
+        close_connection();
+        resp.err_code = ASTERNET_ERR_PROTOCOL;
+        resp.failure_stage = "header";
+        resp.total_ms = monotonic_ms() - t_start;
+        return ASTERNET_ERR_PROTOCOL;
     }
 
     std::string body = raw.substr(header_end + 4);
     const size_t max_body = req.max_response_body_bytes;
-    if (chunked) {
+    const bool no_body_status = req.method == "HEAD"
+        || resp.http_status == 204 || resp.http_status == 304;
+    if (no_body_status) {
+        if (!body.empty()) {
+            close_connection();
+            resp.err_code = ASTERNET_ERR_PROTOCOL;
+            resp.failure_stage = "body";
+            resp.total_ms = monotonic_ms() - t_start;
+            return ASTERNET_ERR_PROTOCOL;
+        }
+        resp.body.clear();
+    } else if (chunked) {
         std::string decoded_body;
         ChunkParseResult parse_result = ChunkParseResult::kIncomplete;
         while (parse_result == ChunkParseResult::kIncomplete
@@ -352,9 +482,16 @@ int Http1Engine::request(const Request &req, Response &resp) {
             resp.total_ms = monotonic_ms() - t_start;
             return ASTERNET_ERR_PROTOCOL;
         }
+        if (body.size() > cl) {
+            close_connection();
+            resp.err_code = ASTERNET_ERR_PROTOCOL;
+            resp.failure_stage = "body";
+            resp.total_ms = monotonic_ms() - t_start;
+            return ASTERNET_ERR_PROTOCOL;
+        }
         resp.body = body.substr(0, cl);
     } else {
-        // 无 Content-Length 且非 chunked（Connection: close），读到 EOF
+        // 无 Content-Length 且非 chunked 时，读到 EOF；这类响应不能安全复用连接。
         while (body.size() <= max_body) {
             const size_t remaining = max_body - body.size();
             const size_t read_size = std::min(remaining + 1, sizeof(buf));
@@ -379,12 +516,14 @@ int Http1Engine::request(const Request &req, Response &resp) {
         return ASTERNET_ERR_BUFFER_TOO_SMALL;
     }
 
-    close_connection();
+    if (connection_close || no_body_status || (!chunked && cl == std::string::npos)) {
+        close_connection();
+    }
 
     resp.total_ms = monotonic_ms() - t_start;
 
-    ASTER_LOG_INFO("asternet-h1", "<== OK status=%d body_len=%zu total_ms=%lld",
-               resp.http_status, resp.body.size(), (long long)resp.total_ms);
+    ASTER_LOG_INFO("asternet-h1", "<== OK status=%d body_len=%zu total_ms=%lld reused=%d",
+               resp.http_status, resp.body.size(), (long long)resp.total_ms, (int)resp.connection_reused);
     resp.err_code = ASTERNET_OK;
     return ASTERNET_OK;
 }

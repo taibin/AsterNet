@@ -13,6 +13,8 @@
 
 #include "engine.h"
 
+#include <memory>
+#include <mutex>
 #include <utility>
 
 namespace asternet {
@@ -20,10 +22,8 @@ namespace engine {
 
 class Http2Engine : public NetworkEngine {
 public:
-    explicit Http2Engine(bool allow_insecure_tls_for_testing, std::string ca_cert_pem = {})
-        : allow_insecure_tls_for_testing_(allow_insecure_tls_for_testing),
-          ca_cert_pem_(std::move(ca_cert_pem)) {}
-    ~Http2Engine() override = default;
+    explicit Http2Engine(bool allow_insecure_tls_for_testing, std::string ca_cert_pem = {});
+    ~Http2Engine() override;
 
     EngineType type() const override { return EngineType::kHttp2; }
     EngineCaps caps() const override {
@@ -33,10 +33,18 @@ public:
     }
 
     int request(const Request &req, Response &resp) override;
+    int migrate_connection() override;
 
 private:
+    struct PooledConnection;
+
+    int ensure_connection(const Request &req, Response &resp, int64_t deadline_ms, bool &reused);
+    void close_connection();
+
     bool allow_insecure_tls_for_testing_ = false;
     std::string ca_cert_pem_;
+    std::mutex mutex_;
+    std::unique_ptr<PooledConnection> connection_;
 };
 
 }  // namespace engine

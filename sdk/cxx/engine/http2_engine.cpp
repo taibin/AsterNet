@@ -56,6 +56,7 @@ struct H2Ctx {
     static constexpr size_t kMaxResponseBody = 16 * 1024 * 1024;
     SSL *ssl = nullptr;
     std::string req_body;     // 请求 body（POST）
+    std::string req_method;
     std::string authority;    // :authority 必须在 nghttp2_submit_request 调用期间保持有效
     std::string pending_data; // send_callback 中读到的响应数据，交由主循环解析
     size_t req_body_sent = 0;
@@ -64,6 +65,9 @@ struct H2Ctx {
     bool got_status = false;
     bool stream_closed = false;
     bool got_end_stream = false;
+    bool response_body_allowed = true;
+    bool forbidden_body_received = false;
+    bool goaway_received = false;
     int32_t stream_id = 0;
     uint32_t stream_error = NGHTTP2_NO_ERROR;
     size_t response_header_bytes = 0;
@@ -160,7 +164,14 @@ static int on_header_callback(nghttp2_session * /*session*/, const nghttp2_frame
             memcpy(sbuf, value, cpy);
             sbuf[cpy] = '\0';
             ctx->http_status = atoi(sbuf);
-            ctx->got_status = true;
+            if (ctx->http_status >= 100 && ctx->http_status < 200) {
+                ctx->response_body_allowed = false;
+            } else {
+                ctx->got_status = true;
+                ctx->response_body_allowed = ctx->req_method != "HEAD"
+                    && ctx->http_status != 204
+                    && ctx->http_status != 304;
+            }
         }
     }
     return 0;
@@ -172,6 +183,10 @@ static int on_data_chunk_recv_callback(nghttp2_session * /*session*/, uint8_t /*
                                        size_t length, void *user_data) {
     auto *ctx = static_cast<H2Ctx *>(user_data);
     if (stream_id != ctx->stream_id) return 0;
+    if (!ctx->response_body_allowed && length > 0) {
+        ctx->forbidden_body_received = true;
+        return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+    }
     if (length > ctx->max_response_body_bytes
         || ctx->resp_body.size() > ctx->max_response_body_bytes - length) {
         ctx->body_limit_exceeded = true;
@@ -194,6 +209,10 @@ static int on_stream_close_callback(nghttp2_session * /*session*/, int32_t strea
 static int on_frame_recv_callback(nghttp2_session * /*session*/, const nghttp2_frame *frame,
                                   void *user_data) {
     auto *ctx = static_cast<H2Ctx *>(user_data);
+    if (frame->hd.type == NGHTTP2_GOAWAY) {
+        ctx->goaway_received = true;
+        return 0;
+    }
     if (frame->hd.stream_id != ctx->stream_id) return 0;
     const bool response_body_end = frame->hd.type == NGHTTP2_DATA
         || frame->hd.type == NGHTTP2_HEADERS;
@@ -253,50 +272,90 @@ int connect_tcp(const char *host, uint16_t port, int64_t deadline_ms) {
 
 }  // namespace
 
-int Http2Engine::request(const Request &req, Response &resp) {
-    resp = Response{};
-    resp.protocol = ASTERNET_PROTOCOL_HTTP_2;
-    resp.dns_ms = req.dns_ms;
-    ASTER_LOG_INFO("asternet-h2", "==> %s:%d %s timeout_ms=%d",
-               req.host.c_str(), req.port, req.method.c_str(), req.timeout_ms);
-    const int64_t t_start = monotonic_ms();
-    const int64_t deadline_ms = t_start + req.timeout_ms;
+struct Http2Engine::PooledConnection {
+    int fd = -1;
+    SSL_CTX *ctx = nullptr;
+    SSL *ssl = nullptr;
+    nghttp2_session *session = nullptr;
+    std::string host;
+    std::string endpoint;
+    std::string ca_cert_pem;
+    uint16_t port = 0;
+    uint64_t network_epoch = 0;
+    bool allow_insecure = false;
 
-    // 1. TCP connect
-    const char *endpoint = req.connect_host.empty() ? req.host.c_str() : req.connect_host.c_str();
-    const int64_t connect_start = monotonic_ms();
-    int fd = connect_tcp(endpoint, req.port, deadline_ms);
-    resp.connect_ms = monotonic_ms() - connect_start;
-    if (fd < 0) {
-        resp.err_code = ASTERNET_ERR_CONNECT;
-        resp.failure_stage = "connect";
-        resp.total_ms = monotonic_ms() - t_start;
-        return ASTERNET_ERR_CONNECT;
+    ~PooledConnection() {
+        if (session != nullptr) nghttp2_session_del(session);
+        if (ssl != nullptr) SSL_free(ssl);
+        if (ctx != nullptr) SSL_CTX_free(ctx);
+        if (fd >= 0) close(fd);
     }
+};
 
-    // 2. TLS + ALPN h2
-    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
-    if (!ctx) { close(fd); resp.err_code = ASTERNET_ERR_TLS; return ASTERNET_ERR_TLS; }
+Http2Engine::Http2Engine(bool allow_insecure_tls_for_testing, std::string ca_cert_pem)
+    : allow_insecure_tls_for_testing_(allow_insecure_tls_for_testing),
+      ca_cert_pem_(std::move(ca_cert_pem)) {}
+
+Http2Engine::~Http2Engine() {
+    close_connection();
+}
+
+void Http2Engine::close_connection() {
+    if (!connection_) return;
+    connection_.reset();
+}
+
+int Http2Engine::ensure_connection(const Request &req, Response &resp, int64_t deadline_ms, bool &reused) {
+    reused = false;
+    const std::string endpoint = req.connect_host.empty() ? req.host : req.connect_host;
 #ifdef ASTERNET_ALLOW_INSECURE_TLS_FOR_TESTING
     const bool allow_insecure = allow_insecure_tls_for_testing_;
 #else
     const bool allow_insecure = false;
 #endif
+    const std::string ca_bundle = req.ca_cert_pem.empty() ? ca_cert_pem_ : req.ca_cert_pem;
+    if (connection_ != nullptr
+        && connection_->fd >= 0
+        && connection_->ssl != nullptr
+        && connection_->ctx != nullptr
+        && connection_->session != nullptr
+        && connection_->host == req.host
+        && connection_->endpoint == endpoint
+        && connection_->port == req.port
+        && connection_->ca_cert_pem == ca_bundle
+        && connection_->network_epoch == req.network_epoch
+        && connection_->allow_insecure == allow_insecure) {
+        reused = true;
+        return ASTERNET_OK;
+    }
+
+    close_connection();
+
+    const int64_t connect_start = monotonic_ms();
+    int fd = connect_tcp(endpoint.c_str(), req.port, deadline_ms);
+    resp.connect_ms = monotonic_ms() - connect_start;
+    if (fd < 0) {
+        return ASTERNET_ERR_CONNECT;
+    }
+
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    if (ctx == nullptr) {
+        close(fd);
+        return ASTERNET_ERR_TLS;
+    }
     SSL_CTX_set_verify(ctx, allow_insecure ? SSL_VERIFY_NONE : SSL_VERIFY_PEER, nullptr);
-    const std::string &ca_bundle = req.ca_cert_pem.empty() ? ca_cert_pem_ : req.ca_cert_pem;
     const bool trust_ready = allow_insecure
         || (!ca_bundle.empty() ? asternet::platform::load_ca_bundle(ctx, ca_bundle)
                                : SSL_CTX_set_default_verify_paths(ctx) == 1);
     if (!trust_ready) {
         SSL_CTX_free(ctx);
         close(fd);
-        resp.err_code = ASTERNET_ERR_TLS;
         return ASTERNET_ERR_TLS;
     }
+
     if (SSL_CTX_set_alpn_protos(ctx, (const unsigned char *)"\x02h2", 3) != 0) {
         SSL_CTX_free(ctx);
         close(fd);
-        resp.err_code = ASTERNET_ERR_TLS;
         return ASTERNET_ERR_TLS;
     }
 
@@ -304,78 +363,51 @@ int Http2Engine::request(const Request &req, Response &resp) {
     if (ssl == nullptr) {
         SSL_CTX_free(ctx);
         close(fd);
-        resp.err_code = ASTERNET_ERR_OUT_OF_MEMORY;
         return ASTERNET_ERR_OUT_OF_MEMORY;
     }
     if (SSL_set_tlsext_host_name(ssl, req.host.c_str()) != 1 || SSL_set_fd(ssl, fd) != 1) {
         SSL_free(ssl);
         SSL_CTX_free(ctx);
         close(fd);
-        resp.err_code = ASTERNET_ERR_TLS;
         return ASTERNET_ERR_TLS;
     }
     if (!allow_insecure && SSL_set1_host(ssl, req.host.c_str()) != 1) {
         SSL_free(ssl);
         SSL_CTX_free(ctx);
         close(fd);
-        resp.err_code = ASTERNET_ERR_TLS;
         return ASTERNET_ERR_TLS;
     }
-    // 非阻塞 socket 下 SSL_connect 可能需多次重试
+
     const int64_t tls_start = monotonic_ms();
     int ssl_ret;
     while ((ssl_ret = SSL_connect(ssl)) != 1) {
-        int ssl_err = SSL_get_error(ssl, ssl_ret);
+        const int ssl_err = SSL_get_error(ssl, ssl_ret);
         if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
-            int selected = select_with_deadline(fd, ssl_err == SSL_ERROR_WANT_READ,
-                                                ssl_err == SSL_ERROR_WANT_WRITE, deadline_ms);
+            const int selected = select_with_deadline(fd, ssl_err == SSL_ERROR_WANT_READ,
+                                                     ssl_err == SSL_ERROR_WANT_WRITE,
+                                                     deadline_ms);
             if (selected <= 0) {
                 SSL_free(ssl);
                 SSL_CTX_free(ctx);
                 close(fd);
-                resp.err_code = selected == 0 ? ASTERNET_ERR_TIMEOUT : ASTERNET_ERR_TLS;
                 resp.tls_ms = monotonic_ms() - tls_start;
-                resp.failure_stage = resp.err_code == ASTERNET_ERR_TIMEOUT ? "tls" : "tls";
-                resp.total_ms = monotonic_ms() - t_start;
-                return resp.err_code;
+                return selected == 0 ? ASTERNET_ERR_TIMEOUT : ASTERNET_ERR_TLS;
             }
             continue;
         }
-        SSL_free(ssl); SSL_CTX_free(ctx); close(fd);
-        resp.err_code = ASTERNET_ERR_TLS;
-        resp.tls_ms = monotonic_ms() - tls_start;
-        resp.failure_stage = "tls";
-        resp.total_ms = monotonic_ms() - t_start;
-        return ASTERNET_ERR_TLS;
-    }
-    resp.tls_ms = monotonic_ms() - tls_start;
-    // 校验 ALPN 协商结果
-    const unsigned char *alpn = nullptr;
-    unsigned int alpn_len = 0;
-    SSL_get0_alpn_selected(ssl, &alpn, &alpn_len);
-    if (alpn_len != 2 || memcmp(alpn, "h2", 2) != 0) {
-        ASTER_LOG_WARN("asternet-h2", "ALPN negotiation failed: expected=h2 actual=%.*s",
-                   (int)alpn_len, alpn ? reinterpret_cast<const char *>(alpn) : "");
         SSL_free(ssl);
         SSL_CTX_free(ctx);
         close(fd);
-        resp.err_code = ASTERNET_ERR_PROTOCOL;
-        return ASTERNET_ERR_PROTOCOL;
+        resp.tls_ms = monotonic_ms() - tls_start;
+        return ASTERNET_ERR_TLS;
     }
-
-    // 3. nghttp2 session
-    H2Ctx h2ctx;
-    h2ctx.ssl = ssl;
-    h2ctx.req_body = req.body;
-    h2ctx.max_response_body_bytes = req.max_response_body_bytes;
-    h2ctx.deadline_ms = deadline_ms;
+    resp.tls_ms = monotonic_ms() - tls_start;
 
     nghttp2_session_callbacks *cbs = nullptr;
     if (nghttp2_session_callbacks_new(&cbs) != 0) {
         SSL_free(ssl);
         SSL_CTX_free(ctx);
         close(fd);
-        resp.err_code = ASTERNET_ERR_OUT_OF_MEMORY;
         return ASTERNET_ERR_OUT_OF_MEMORY;
     }
     nghttp2_session_callbacks_set_send_callback(cbs, send_callback);
@@ -385,27 +417,101 @@ int Http2Engine::request(const Request &req, Response &resp) {
     nghttp2_session_callbacks_set_on_stream_close_callback(cbs, on_stream_close_callback);
 
     nghttp2_session *session = nullptr;
-    if (nghttp2_session_client_new(&session, cbs, &h2ctx) != 0) {
+    if (nghttp2_session_client_new(&session, cbs, nullptr) != 0) {
         nghttp2_session_callbacks_del(cbs);
         SSL_free(ssl);
         SSL_CTX_free(ctx);
         close(fd);
-        resp.err_code = ASTERNET_ERR_OUT_OF_MEMORY;
         return ASTERNET_ERR_OUT_OF_MEMORY;
     }
     nghttp2_session_callbacks_del(cbs);
 
-    // 4. HTTP/2 client preface 必须在 magic 后发送首个 SETTINGS 帧。
-    int settings_ret = nghttp2_submit_settings(session, NGHTTP2_FLAG_NONE, nullptr, 0);
-    if (settings_ret != 0) {
-        nghttp2_session_del(session);
-        SSL_free(ssl);
-        SSL_CTX_free(ctx);
-        close(fd);
-        resp.err_code = settings_ret == NGHTTP2_ERR_NOMEM
-                            ? ASTERNET_ERR_OUT_OF_MEMORY
-                            : ASTERNET_ERR_PROTOCOL;
-        return resp.err_code;
+    connection_ = std::make_unique<PooledConnection>();
+    connection_->fd = fd;
+    connection_->ctx = ctx;
+    connection_->ssl = ssl;
+    connection_->session = session;
+    connection_->host = req.host;
+    connection_->endpoint = endpoint;
+    connection_->ca_cert_pem = ca_bundle;
+    connection_->port = req.port;
+    connection_->network_epoch = req.network_epoch;
+    connection_->allow_insecure = allow_insecure;
+    return ASTERNET_OK;
+}
+
+int Http2Engine::request(const Request &req, Response &resp) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    resp = Response{};
+    resp.protocol = ASTERNET_PROTOCOL_HTTP_2;
+    resp.dns_ms = req.dns_ms;
+    ASTER_LOG_INFO("asternet-h2", "==> %s:%d %s timeout_ms=%d",
+               req.host.c_str(), req.port, req.method.c_str(), req.timeout_ms);
+    const int64_t t_start = monotonic_ms();
+    const int64_t deadline_ms = t_start + req.timeout_ms;
+    H2Ctx h2ctx;
+    h2ctx.req_body = req.body;
+    h2ctx.req_method = req.method;
+    h2ctx.response_body_allowed = req.method != "HEAD";
+    h2ctx.max_response_body_bytes = req.max_response_body_bytes;
+    h2ctx.deadline_ms = deadline_ms;
+
+    auto has_crlf = [](const std::string &s) {
+        return s.find_first_of("\r\n") != std::string::npos;
+    };
+    if (has_crlf(req.host) || has_crlf(req.connect_host) || has_crlf(req.method)
+        || has_crlf(req.path)) {
+        resp.err_code = ASTERNET_ERR_PROTOCOL;
+        resp.failure_stage = "header";
+        resp.total_ms = monotonic_ms() - t_start;
+        return ASTERNET_ERR_PROTOCOL;
+    }
+
+    bool reused = false;
+    const int conn_ret = ensure_connection(req, resp, deadline_ms, reused);
+    if (conn_ret != ASTERNET_OK) {
+        resp.err_code = conn_ret;
+        resp.failure_stage = conn_ret == ASTERNET_ERR_CONNECT ? "connect" : "tls";
+        resp.total_ms = monotonic_ms() - t_start;
+        return conn_ret;
+    }
+    resp.connection_reused = reused;
+    if (reused) {
+        resp.connect_ms = 0;
+        resp.tls_ms = 0;
+    }
+
+    PooledConnection *pooled = connection_.get();
+    SSL *ssl = pooled->ssl;
+    nghttp2_session *session = pooled->session;
+    int fd = pooled->fd;
+    h2ctx.ssl = ssl;
+
+    // nghttp2 回调 user_data 绑定到当前请求上下文；请求完成后再重置。
+    nghttp2_session_set_user_data(session, &h2ctx);
+    if (!reused) {
+        int settings_ret = nghttp2_submit_settings(session, NGHTTP2_FLAG_NONE, nullptr, 0);
+        if (settings_ret != 0) {
+            close_connection();
+            resp.err_code = settings_ret == NGHTTP2_ERR_NOMEM
+                                ? ASTERNET_ERR_OUT_OF_MEMORY
+                                : ASTERNET_ERR_PROTOCOL;
+            resp.total_ms = monotonic_ms() - t_start;
+            return resp.err_code;
+        }
+    }
+
+    const unsigned char *alpn = nullptr;
+    unsigned int alpn_len = 0;
+    SSL_get0_alpn_selected(ssl, &alpn, &alpn_len);
+    if (alpn_len != 2 || memcmp(alpn, "h2", 2) != 0) {
+        ASTER_LOG_WARN("asternet-h2", "ALPN negotiation failed: expected=h2 actual=%.*s",
+                   (int)alpn_len, alpn ? reinterpret_cast<const char *>(alpn) : "");
+        close_connection();
+        resp.err_code = ASTERNET_ERR_PROTOCOL;
+        resp.failure_stage = "protocol";
+        resp.total_ms = monotonic_ms() - t_start;
+        return ASTERNET_ERR_PROTOCOL;
     }
 
     // 5. 构造请求头并 submit
@@ -427,7 +533,51 @@ int Http2Engine::request(const Request &req, Response &resp) {
     add_nv(":authority", h2ctx.authority.c_str());
     add_nv(":path", req.path.c_str());
     add_nv("user-agent", "asternet/0.1");
-    for (const auto &h : req.headers) add_nv(h.name.c_str(), h.value.c_str());
+    auto append_custom_header = [&](const Header &h) -> bool {
+        if (has_crlf(h.name) || has_crlf(h.value) || h.name.empty() || h.name[0] == ':') {
+            return false;
+        }
+        for (unsigned char c : h.name) {
+            const bool alnum = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z')
+                || (c >= 'a' && c <= 'z');
+            const bool token = alnum || c == '!' || c == '#' || c == '$' || c == '%'
+                || c == '&' || c == '\'' || c == '*' || c == '+' || c == '-'
+                || c == '.' || c == '^' || c == '_' || c == '`' || c == '|'
+                || c == '~';
+            if (!token) return false;
+        }
+        std::string lower_name;
+        lower_name.reserve(h.name.size());
+        for (char c : h.name) lower_name += static_cast<char>(tolower(static_cast<unsigned char>(c)));
+        if (lower_name == "te") {
+            std::string lower_value;
+            lower_value.reserve(h.value.size());
+            for (char c : h.value) lower_value += static_cast<char>(tolower(static_cast<unsigned char>(c)));
+            while (!lower_value.empty() && (lower_value.front() == ' ' || lower_value.front() == '\t')) {
+                lower_value.erase(lower_value.begin());
+            }
+            while (!lower_value.empty() && (lower_value.back() == ' ' || lower_value.back() == '\t')) {
+                lower_value.pop_back();
+            }
+            if (lower_value != "trailers") return false;
+        }
+        if (lower_name == "host" || lower_name == "connection" || lower_name == "content-length"
+            || lower_name == "transfer-encoding" || lower_name == "keep-alive"
+            || lower_name == "proxy-connection" || lower_name == "upgrade") {
+            return true;
+        }
+        add_nv(h.name.c_str(), h.value.c_str());
+        return true;
+    };
+    for (const auto &h : req.headers) {
+        if (!append_custom_header(h)) {
+            close_connection();
+            resp.err_code = ASTERNET_ERR_PROTOCOL;
+            resp.failure_stage = "header";
+            resp.total_ms = monotonic_ms() - t_start;
+            return ASTERNET_ERR_PROTOCOL;
+        }
+    }
 
     nghttp2_data_provider data_prd{};
     data_prd.read_callback = data_read_callback;
@@ -435,8 +585,11 @@ int Http2Engine::request(const Request &req, Response &resp) {
                                                req.body.empty() ? nullptr : &data_prd, &h2ctx);
     ASTER_LOG_INFO("asternet-h2", "  submit_request stream_id=%d", (int)stream_id);
     if (stream_id < 0) {
-        nghttp2_session_del(session); SSL_free(ssl); SSL_CTX_free(ctx); close(fd);
-        resp.err_code = ASTERNET_ERR_PROTOCOL; return ASTERNET_ERR_PROTOCOL;
+        close_connection();
+        resp.err_code = ASTERNET_ERR_PROTOCOL;
+        resp.failure_stage = "protocol";
+        resp.total_ms = monotonic_ms() - t_start;
+        return ASTERNET_ERR_PROTOCOL;
     }
     h2ctx.stream_id = stream_id;
 
@@ -519,6 +672,8 @@ int Http2Engine::request(const Request &req, Response &resp) {
 
     if (h2ctx.body_limit_exceeded) {
         ret = ASTERNET_ERR_BUFFER_TOO_SMALL;
+    } else if (h2ctx.forbidden_body_received) {
+        ret = ASTERNET_ERR_PROTOCOL;
     } else if (ret == ASTERNET_OK && (!h2ctx.got_status || !h2ctx.got_end_stream
                                        || h2ctx.stream_error != NGHTTP2_NO_ERROR)) {
         ret = ASTERNET_ERR_PROTOCOL;
@@ -527,15 +682,20 @@ int Http2Engine::request(const Request &req, Response &resp) {
     resp.http_status = h2ctx.http_status;
     resp.body = std::move(h2ctx.resp_body);
 
-    nghttp2_session_del(session);
-    SSL_free(ssl);
-    SSL_CTX_free(ctx);
-    close(fd);
+    const bool keep_connection = ret == ASTERNET_OK && h2ctx.got_status && h2ctx.got_end_stream
+        && h2ctx.stream_error == NGHTTP2_NO_ERROR && !h2ctx.body_limit_exceeded
+        && !h2ctx.forbidden_body_received && !h2ctx.goaway_received;
+    if (connection_ != nullptr && connection_->session != nullptr) {
+        nghttp2_session_set_user_data(connection_->session, nullptr);
+    }
+    if (!keep_connection) {
+        close_connection();
+    }
 
     resp.total_ms = monotonic_ms() - t_start;
 
-    ASTER_LOG_INFO("asternet-h2", "<== ret=%d status=%d body_len=%zu total_ms=%lld",
-               ret, resp.http_status, resp.body.size(), (long long)resp.total_ms);
+    ASTER_LOG_INFO("asternet-h2", "<== ret=%d status=%d body_len=%zu total_ms=%lld reused=%d",
+               ret, resp.http_status, resp.body.size(), (long long)resp.total_ms, (int)resp.connection_reused);
     resp.err_code = ret;
     if (ret != ASTERNET_OK) {
         resp.failure_stage = ret == ASTERNET_ERR_TIMEOUT ? "timeout"
@@ -543,6 +703,12 @@ int Http2Engine::request(const Request &req, Response &resp) {
             : ret == ASTERNET_ERR_CONNECT ? "connect" : "protocol";
     }
     return ret;
+}
+
+int Http2Engine::migrate_connection() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    close_connection();
+    return ASTERNET_OK;
 }
 
 }  // namespace engine
