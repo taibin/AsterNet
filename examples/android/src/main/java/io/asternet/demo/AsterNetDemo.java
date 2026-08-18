@@ -50,4 +50,26 @@ final class AsterNetDemo {
         }
         return output.toString();
     }
+
+    static String formatMetrics(AsterNet.MetricsEvent event) {
+        AsterNet.Response response = event.response;
+        StringBuilder output = new StringBuilder();
+        output.append("Metrics callback\n");
+        output.append(event.method).append(" https://").append(event.host);
+        if (event.port != 443) output.append(':').append(event.port);
+        output.append(event.path).append('\n');
+        output.append("Policy: ").append(policyName(event.policy)).append('\n');
+        output.append("Result: ").append(response.error).append(" (").append(response.result).append(")\n");
+        output.append("Protocol: ").append(response.protocolName()).append('\n');
+        output.append("HTTP status: ").append(response.status).append('\n');
+        output.append("Fallback used: ").append(response.degraded).append('\n');
+        output.append("Body bytes: ").append(response.bodySize).append('\n');
+        output.append("DNS: ").append(response.dnsMs).append(" ms\n");
+        output.append("Connect: ").append(response.connectMs).append(" ms\n");
+        output.append("TLS/QUIC handshake: ").append(response.tlsMs).append(" ms\n");
+        output.append("TTFB: ").append(response.ttfbMs).append(" ms\n");
+        output.append("Core total: ").append(response.totalMs).append(" ms\n");
+        output.append("Wall clock: ").append(event.wallMs).append(" ms\n");
+        return output.toString();
+    }
 }

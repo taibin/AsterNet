@@ -76,6 +76,8 @@ private:
         uint32_t    packets_lost = 0;
         xqc_usec_t  srtt_us = 0;
         int64_t     start_ms = 0;
+        int64_t     tls_start_ms = 0;
+        int64_t     tls_ms = -1;
         int64_t     ttfb_ms = -1;
         size_t      request_body_sent = 0;
         size_t      max_response_body_bytes = 16 * 1024 * 1024;

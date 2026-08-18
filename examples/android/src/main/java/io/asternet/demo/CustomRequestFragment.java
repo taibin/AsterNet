@@ -124,7 +124,8 @@ public final class CustomRequestFragment extends Fragment {
                     response = client.request(host, port, method, path, policy,
                         headersText, body, timeoutMs,
                         "GET".equals(method) || "HEAD".equals(method) || "OPTIONS".equals(method),
-                        allowInsecure);
+                        allowInsecure,
+                        event -> Log.i(TAG, AsterNetDemo.formatMetrics(event)));
                 }
             } catch (Exception e) {
                 Log.e(TAG, "Custom request exception: " + e.getMessage(), e);

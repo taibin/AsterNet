@@ -1,3 +1,4 @@
+#include "client.h"
 #include "connection/connection_pool.h"
 #include "dns/dns_resolver.h"
 #include "engine/protocol_selector.h"
@@ -12,6 +13,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -40,6 +42,12 @@ public:
 private:
     asternet::engine::EngineType type_;
     int result_;
+};
+
+class StubMetricsCollector final : public asternet::monitor::MetricsCollector {
+public:
+    void report(const asternet_response_info_t &) override {}
+    std::string dump() const override { return "{\"custom_metrics\":true}"; }
 };
 
 void test_dns() {
@@ -266,7 +274,48 @@ void test_orchestrator_and_metrics() {
     info.total_ms = 12;
     collector.report(info);
     assert(collector.recent_events().size() == 1);
-    assert(collector.dump().find("avg_total_ms") != std::string::npos);
+    const std::string metrics_dump = collector.dump();
+    assert(metrics_dump.find("\"stages\"") != std::string::npos);
+    assert(metrics_dump.find("\"dns\"") != std::string::npos);
+    assert(metrics_dump.find("\"success_rate\"") != std::string::npos);
+
+    asternet::monitor::MetricsCollectorImpl detailed_collector(4);
+    asternet::monitor::RequestMetrics h3_metrics;
+    h3_metrics.response.result = ASTERNET_OK;
+    h3_metrics.response.protocol = ASTERNET_PROTOCOL_HTTP_3;
+    h3_metrics.response.dns_ms = 1;
+    h3_metrics.response.connect_ms = 2;
+    h3_metrics.response.tls_ms = 5;
+    h3_metrics.response.ttfb_ms = 8;
+    h3_metrics.response.total_ms = 20;
+    h3_metrics.attempts = 2;
+    h3_metrics.connection_reused = true;
+    h3_metrics.cache_hit = true;
+    detailed_collector.report_request(h3_metrics);
+    const asternet::monitor::MetricsSnapshot h3_snapshot = detailed_collector.snapshot();
+    assert(h3_snapshot.requests == 1);
+    assert(h3_snapshot.attempts == 2);
+    assert(h3_snapshot.tls.started == 1);
+    assert(h3_snapshot.tls.succeeded == 1);
+    assert(h3_snapshot.ttfb.started == 1);
+    assert(h3_snapshot.ttfb.succeeded == 1);
+    assert(h3_snapshot.transfer.average_ms() == 12);
+
+    asternet::monitor::RequestMetrics failure_metrics;
+    failure_metrics.response.result = ASTERNET_ERR_PROTOCOL;
+    failure_metrics.response.dns_ms = -1;
+    failure_metrics.response.connect_ms = -1;
+    failure_metrics.response.tls_ms = -1;
+    failure_metrics.response.ttfb_ms = -1;
+    failure_metrics.response.total_ms = 3;
+    failure_metrics.failure_stage = "body";
+    failure_metrics.failure_stage.push_back('\x01');
+    detailed_collector.report_request(failure_metrics);
+    assert(detailed_collector.dump().find("\\u0001") != std::string::npos);
+
+    asternet::Client client({});
+    assert(client.set_metrics_collector(std::make_shared<StubMetricsCollector>()) == ASTERNET_OK);
+    assert(client.dump_diag().find("\"metrics\"") != std::string::npos);
 }
 
 void test_protocol_codec() {

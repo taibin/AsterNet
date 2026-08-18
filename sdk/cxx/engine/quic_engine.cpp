@@ -212,8 +212,7 @@ int QuicEngine::request(const Request &req, Response &resp) {
     resp = Response{};
     resp.protocol = ASTERNET_PROTOCOL_HTTP_3;
     resp.dns_ms = req.dns_ms;
-    ASTER_LOG_INFO("asternet-h3", "==> %s:%d %s timeout_ms=%d",
-               req.host.c_str(), req.port, req.method.c_str(), req.timeout_ms);
+    ASTER_LOG_INFO("asternet-h3", "==> request timeout_ms=%d", req.timeout_ms);
     if (init_engine() < 0) {
         return fail_early(ASTERNET_ERR_INTERNAL);
     }
@@ -341,6 +340,7 @@ int QuicEngine::request(const Request &req, Response &resp) {
     if (!allow_insecure) {
         conn_ssl_cfg.cert_verify_flag |= XQC_TLS_CERT_FLAG_NEED_VERIFY;
     }
+    cur_req_->tls_start_ms = monotonic_ms();
     const xqc_cid_t *cid = xqc_h3_connect(engine_, &conn_settings, nullptr, 0,
                                           req.host.c_str(), 0, &conn_ssl_cfg,
                                           (struct sockaddr *)&srv_addr, srv_addr_len, this);
@@ -379,6 +379,7 @@ int QuicEngine::request(const Request &req, Response &resp) {
         }
     }
     resp.http_status = ctx.http_status;
+    resp.tls_ms = ctx.tls_ms;
     resp.ttfb_ms = ctx.ttfb_ms;
     resp.total_ms = monotonic_ms() - request_start_ms;
     const size_t body_len = ctx.response_body.size();
@@ -394,6 +395,7 @@ int QuicEngine::request(const Request &req, Response &resp) {
         ret = ASTERNET_ERR_TLS;
     } else if (ctx.body_limit_exceeded) {
         resp.err_code = ASTERNET_ERR_BUFFER_TOO_SMALL;
+        resp.failure_stage = "body";
         ret = ASTERNET_ERR_BUFFER_TOO_SMALL;
     } else if (timed_out) {
         resp.err_code = ASTERNET_ERR_TIMEOUT;
@@ -487,9 +489,9 @@ void QuicEngine::conn_update_cid_notify_cb(xqc_connection_t * /*conn*/,
     // 当前请求使用已 connect 的 UDP socket，无需额外维护 CID 映射。
 }
 
-void QuicEngine::log_write_err_cb(xqc_log_level_t /*lvl*/, const void *buf, size_t size,
+void QuicEngine::log_write_err_cb(xqc_log_level_t /*lvl*/, const void * /*buf*/, size_t size,
                                    void * /*user_data*/) {
-    (void)fwrite(buf, 1, size, stderr);
+    ASTER_LOG_DEBUG("asternet-h3", "xquic internal log suppressed bytes=%zu", size);
 }
 
 int QuicEngine::cert_verify_cb(const unsigned char *certs[], const size_t cert_len[],
@@ -563,6 +565,10 @@ void QuicEngine::h3_conn_handshake_finished_cb(xqc_h3_conn_t * /*h3_conn*/, void
         return;
     }
     RequestContext &ctx = *self->cur_req_;
+    if (ctx.tls_ms < 0) {
+        const int64_t tls_start = ctx.tls_start_ms > 0 ? ctx.tls_start_ms : ctx.start_ms;
+        ctx.tls_ms = monotonic_ms() - tls_start;
+    }
     if (ctx.h3_request != nullptr) return;
 
     // 创建 H3 请求流（settings 需非空，参考 mini_client）

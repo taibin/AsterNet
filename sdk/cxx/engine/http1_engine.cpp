@@ -309,7 +309,6 @@ int Http1Engine::request(const Request &req, Response &resp) {
     char buf[4096];
     size_t header_end = std::string::npos;
     constexpr size_t kMaxResponseHeaders = 64 * 1024;
-    const int64_t first_byte_start = monotonic_ms();
     while (header_end == std::string::npos && raw.size() <= kMaxResponseHeaders) {
         ssize_t r = SSL_read(ssl, buf, sizeof(buf));
         if (r <= 0) break;
@@ -323,7 +322,7 @@ int Http1Engine::request(const Request &req, Response &resp) {
         resp.total_ms = monotonic_ms() - t_start;
         return ASTERNET_ERR_PROTOCOL;
     }
-    resp.ttfb_ms = monotonic_ms() - first_byte_start;
+    resp.ttfb_ms = monotonic_ms() - t_start;
 
     auto parse_status = [&]() {
         size_t sp1 = raw.find(' ');

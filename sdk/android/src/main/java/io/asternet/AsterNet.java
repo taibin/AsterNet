@@ -57,6 +57,38 @@ public final class AsterNet {
         }
     }
 
+    public interface MetricsCallback {
+        void onMetrics(MetricsEvent event);
+    }
+
+    public static final class MetricsEvent {
+        public final String host;
+        public final int port;
+        public final String method;
+        public final String path;
+        public final int policy;
+        public final int timeoutMs;
+        public final boolean idempotent;
+        public final boolean allowInsecure;
+        public final long wallMs;
+        public final Response response;
+
+        MetricsEvent(String host, int port, String method, String path, int policy,
+                     int timeoutMs, boolean idempotent, boolean allowInsecure,
+                     long wallMs, Response response) {
+            this.host = host;
+            this.port = port;
+            this.method = method;
+            this.path = path;
+            this.policy = policy;
+            this.timeoutMs = timeoutMs;
+            this.idempotent = idempotent;
+            this.allowInsecure = allowInsecure;
+            this.wallMs = wallMs;
+            this.response = response;
+        }
+    }
+
     public static final class Client implements AutoCloseable {
         private long handle;
 
@@ -71,10 +103,32 @@ public final class AsterNet {
         }
 
         public synchronized Response request(String host, int port, String method, String path,
-                                               int policy, String headers, byte[] body, int timeoutMs,
-                                               boolean idempotent, boolean allowInsecure) {
-            return requestNative(handle, host, port, method, path, policy, headers, body,
-                timeoutMs, idempotent, allowInsecure);
+                                              int policy, String headers, byte[] body, int timeoutMs,
+                                              boolean idempotent, MetricsCallback metricsCallback) {
+            return request(host, port, method, path, policy, headers, body, timeoutMs,
+                idempotent, false, metricsCallback);
+        }
+
+        public synchronized Response request(String host, int port, String method, String path,
+                                              int policy, String headers, byte[] body, int timeoutMs,
+                                              boolean idempotent, boolean allowInsecure) {
+            return request(host, port, method, path, policy, headers, body, timeoutMs,
+                idempotent, allowInsecure, null);
+        }
+
+        public synchronized Response request(String host, int port, String method, String path,
+                                              int policy, String headers, byte[] body, int timeoutMs,
+                                              boolean idempotent, boolean allowInsecure,
+                                              MetricsCallback metricsCallback) {
+            final long wallStart = System.currentTimeMillis();
+            final Response response = requestNative(handle, host, port, method, path, policy,
+                headers, body, timeoutMs, idempotent, allowInsecure);
+            if (metricsCallback != null) {
+                metricsCallback.onMetrics(new MetricsEvent(host, port, method, path, policy,
+                    timeoutMs, idempotent, allowInsecure,
+                    System.currentTimeMillis() - wallStart, response));
+            }
+            return response;
         }
 
         public synchronized int prefetch(String host) {

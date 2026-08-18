@@ -11,10 +11,13 @@
 #define ASTERNET_CLIENT_H
 
 #include <atomic>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <thread>
+#include <deque>
 
 #include "asternet/asternet.h"
 #include "connection/connection_pool.h"
@@ -50,6 +53,7 @@ public:
     void on_network_change(asternet_network_t net);
     std::string dump_diag() const;
     int prefetch(const std::string &host);
+    int set_metrics_collector(std::shared_ptr<monitor::MetricsCollector> collector);
 
     // 统一请求入口：经 ProtocolSelector 降级链选择引擎（H3→H2→H1.1）。
     int request(const engine::Request &req, engine::Response &resp);
@@ -60,10 +64,19 @@ public:
 
 private:
     int execute_transport(orchestrator::RequestContext &context, engine::Response &response);
-    void report_metrics(uint64_t request_id, uint64_t network_epoch,
+    void report_metrics(std::shared_ptr<monitor::MetricsCollector> collector,
+                        uint64_t request_id, uint64_t network_epoch,
                         const orchestrator::RequestContext &context,
                         const engine::Response &response, int result);
+    void enqueue_metrics(monitor::RequestMetrics metrics,
+                         std::shared_ptr<monitor::MetricsCollector> collector);
+    void metrics_worker_loop();
     static const char *failure_stage_for(int result);
+
+    struct PendingMetrics {
+        monitor::RequestMetrics metrics;
+        std::shared_ptr<monitor::MetricsCollector> collector;
+    };
 
     asternet_client_config_t config_{};
     std::string ca_cert_pem_;
@@ -81,6 +94,12 @@ private:
     std::shared_ptr<sdt::QualityProber> quality_prober_;
     std::unique_ptr<orchestrator::RequestOrchestrator> orchestrator_;
     std::shared_ptr<monitor::MetricsCollector> metrics_collector_;
+    std::shared_ptr<monitor::MetricsCollector> metrics_shadow_collector_;
+    std::mutex metrics_queue_mutex_;
+    std::condition_variable metrics_queue_cv_;
+    std::deque<PendingMetrics> metrics_queue_;
+    bool metrics_worker_stop_ = false;
+    std::thread metrics_worker_thread_;
     std::unique_ptr<protocol::GatewayProtocol> gateway_protocol_;
 };
 

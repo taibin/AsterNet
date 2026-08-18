@@ -106,7 +106,8 @@ public final class ScenariosFragment extends Fragment {
                     if (destroyed.get() || client == null) return;
                     response = client.request(parsed.host, parsed.port,
                         scenario.method, parsed.path, scenario.policy, scenario.headers, body,
-                        REQUEST_TIMEOUT_MS, scenario.idempotent);
+                        REQUEST_TIMEOUT_MS, scenario.idempotent,
+                        event -> Log.i(TAG, AsterNetDemo.formatMetrics(event)));
                 }
             } catch (Exception e) {
                 Log.e(TAG, "Request exception: " + e.getMessage(), e);

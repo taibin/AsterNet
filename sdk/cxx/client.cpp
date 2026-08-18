@@ -51,6 +51,10 @@ bool is_replayable_safe_method(const engine::Request &request) {
     return method == "GET" || method == "HEAD" || method == "OPTIONS";
 }
 
+std::shared_ptr<monitor::MetricsCollector> make_default_metrics_collector() {
+    return std::make_shared<monitor::MetricsCollectorImpl>();
+}
+
 }  // namespace
 
 bool Client::check_abi(uint32_t abi_version) {
@@ -104,16 +108,29 @@ Client::Client(const asternet_client_config_t &cfg)
     connection_pool_ = std::move(pool);
     quality_prober_ = std::make_shared<sdt::QualityProberImpl>();
     orchestrator_ = std::make_unique<orchestrator::RequestOrchestrator>(quality_prober_);
-    metrics_collector_ = std::make_shared<monitor::MetricsCollectorImpl>();
+    metrics_shadow_collector_ = make_default_metrics_collector();
+    metrics_collector_ = metrics_shadow_collector_;
+    metrics_worker_thread_ = std::thread([this] { metrics_worker_loop(); });
     gateway_protocol_ = std::make_unique<protocol::DefaultGatewayProtocol>();
 }
 
 Client::~Client() {
     std::unique_lock<std::shared_mutex> lock(lifecycle_mutex_);
     destroyed_.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> queue_lock(metrics_queue_mutex_);
+        metrics_worker_stop_ = true;
+    }
+    metrics_queue_cv_.notify_all();
+    if (metrics_worker_thread_.joinable()) {
+        lock.unlock();
+        metrics_worker_thread_.join();
+        lock.lock();
+    }
     if (connection_pool_) connection_pool_->evict_all();
     gateway_protocol_.reset();
     metrics_collector_.reset();
+    metrics_shadow_collector_.reset();
     orchestrator_.reset();
     quality_prober_.reset();
     connection_pool_.reset();
@@ -141,13 +158,31 @@ void Client::on_network_change(asternet_network_t net) {
 
 std::string Client::dump_diag() const {
     if (is_active_client(const_cast<Client *>(this))) return "{}";
-    std::shared_lock<std::shared_mutex> lock(lifecycle_mutex_);
+    std::string dns_dump;
+    std::string connections_dump;
+    std::string quality_dump;
+    uint64_t epoch = 0;
+    {
+        std::shared_lock<std::shared_mutex> lock(lifecycle_mutex_);
+        epoch = network_epoch_.load(std::memory_order_acquire);
+        dns_dump = dns_resolver_ ? dns_resolver_->dump() : "{}";
+        connections_dump = connection_pool_ ? connection_pool_->dump() : "{}";
+        quality_dump = quality_prober_ ? quality_prober_->dump() : "{}";
+    }
+    std::string metrics_dump = "{}";
+    if (metrics_shadow_collector_) {
+        try {
+            metrics_dump = metrics_shadow_collector_->dump();
+        } catch (...) {
+            ASTER_LOG_WARN("asternet-client", "metrics dump failed");
+        }
+    }
     std::ostringstream out;
-    out << "{\"network_epoch\":" << network_epoch_.load(std::memory_order_acquire)
-        << ",\"dns\":" << (dns_resolver_ ? dns_resolver_->dump() : "{}")
-        << ",\"connections\":" << (connection_pool_ ? connection_pool_->dump() : "{}")
-        << ",\"quality\":" << (quality_prober_ ? quality_prober_->dump() : "{}")
-        << ",\"metrics\":" << (metrics_collector_ ? metrics_collector_->dump() : "{}")
+    out << "{\"network_epoch\":" << epoch
+        << ",\"dns\":" << dns_dump
+        << ",\"connections\":" << connections_dump
+        << ",\"quality\":" << quality_dump
+        << ",\"metrics\":" << metrics_dump
         << "}";
     return out.str();
 }
@@ -163,6 +198,17 @@ int Client::prefetch(const std::string &host) {
     return dns_result;
 }
 
+int Client::set_metrics_collector(std::shared_ptr<monitor::MetricsCollector> collector) {
+    std::unique_lock<std::shared_mutex> lock(lifecycle_mutex_);
+    if (destroyed_.load(std::memory_order_acquire)) return ASTERNET_ERR_CANCELED;
+    if (collector == nullptr) {
+        metrics_collector_ = metrics_shadow_collector_;
+    } else {
+        metrics_collector_ = std::move(collector);
+    }
+    return ASTERNET_OK;
+}
+
 int Client::request(const engine::Request &req, engine::Response &resp) {
     return request_with_policy(req, ASTERNET_POLICY_AUTO, resp, nullptr, nullptr);
 }
@@ -173,37 +219,43 @@ int Client::request_with_policy(const engine::Request &req, asternet_protocol_po
     if (is_active_client(this) || g_active_client_count >= kMaxActiveClients) {
         return ASTERNET_ERR_INTERNAL;
     }
-    std::shared_lock<std::shared_mutex> lock(lifecycle_mutex_);
     ActiveRequestGuard active_guard(this);
-    if (destroyed_.load(std::memory_order_acquire)) return ASTERNET_ERR_CANCELED;
-    if (!selector_ || !orchestrator_) return ASTERNET_ERR_INTERNAL;
-
     const int64_t started_ms = monotonic_ms();
     orchestrator::RequestContext context;
-    context.request = req;
-    context.request.allow_insecure_tls_for_testing = false;
-    context.request.timeout_ms = req.timeout_ms > 0 ? req.timeout_ms
-        : (config_.default_timeout_ms > 0 ? config_.default_timeout_ms : 15000);
-    context.policy = policy;
-    context.request_id = next_request_id_.fetch_add(1, std::memory_order_relaxed);
-    context.network_epoch = network_epoch_.load(std::memory_order_acquire);
-    context.request.network_epoch = context.network_epoch;
-    context.request.retry_safe = req.retry_safe || is_replayable_safe_method(context.request);
-    context.max_retries = context.request.retry_safe ? 1 : 0;
-    context.deadline_ms = started_ms + context.request.timeout_ms;
+    std::shared_ptr<monitor::MetricsCollector> metrics_collector;
+    int ret = ASTERNET_ERR_INTERNAL;
+    {
+        std::shared_lock<std::shared_mutex> lock(lifecycle_mutex_);
+        if (destroyed_.load(std::memory_order_acquire)) return ASTERNET_ERR_CANCELED;
+        if (!selector_ || !orchestrator_) return ASTERNET_ERR_INTERNAL;
 
-    const int ret = orchestrator_->execute(context, resp,
-        [this](orchestrator::RequestContext &request_context, engine::Response &response) {
-            return execute_transport(request_context, response);
-        });
-    if (resp.total_ms < 0) resp.total_ms = monotonic_ms() - started_ms;
-    if (resp.failure_stage.empty() && ret != ASTERNET_OK) {
-        resp.failure_stage = failure_stage_for(ret);
+        context.request = req;
+        context.request.allow_insecure_tls_for_testing = false;
+        context.request.timeout_ms = req.timeout_ms > 0 ? req.timeout_ms
+            : (config_.default_timeout_ms > 0 ? config_.default_timeout_ms : 15000);
+        context.policy = policy;
+        context.request_id = next_request_id_.fetch_add(1, std::memory_order_relaxed);
+        context.network_epoch = network_epoch_.load(std::memory_order_acquire);
+        context.request.network_epoch = context.network_epoch;
+        context.request.retry_safe = req.retry_safe || is_replayable_safe_method(context.request);
+        context.max_retries = context.request.retry_safe ? 1 : 0;
+        context.deadline_ms = started_ms + context.request.timeout_ms;
+
+        ret = orchestrator_->execute(context, resp,
+            [this](orchestrator::RequestContext &request_context, engine::Response &response) {
+                return execute_transport(request_context, response);
+            });
+        if (resp.total_ms < 0) resp.total_ms = monotonic_ms() - started_ms;
+        if (resp.failure_stage.empty() && ret != ASTERNET_OK) {
+            resp.failure_stage = failure_stage_for(ret);
+        }
+        resp.attempts = std::max(resp.attempts, context.attempts);
+        if (out_actual_proto) *out_actual_proto = resp.protocol;
+        if (out_degraded) *out_degraded = resp.degraded;
+        metrics_collector = metrics_collector_;
+        report_metrics(std::move(metrics_collector), context.request_id, context.network_epoch,
+                       context, resp, ret);
     }
-    resp.attempts = std::max(resp.attempts, context.attempts);
-    if (out_actual_proto) *out_actual_proto = resp.protocol;
-    if (out_degraded) *out_degraded = resp.degraded;
-    report_metrics(context.request_id, context.network_epoch, context, resp, ret);
     return ret;
 }
 
@@ -258,10 +310,10 @@ int Client::execute_transport(orchestrator::RequestContext &context, engine::Res
     return result;
 }
 
-void Client::report_metrics(uint64_t request_id, uint64_t network_epoch,
+void Client::report_metrics(std::shared_ptr<monitor::MetricsCollector> collector,
+                            uint64_t request_id, uint64_t network_epoch,
                             const orchestrator::RequestContext &context,
                             const engine::Response &response, int result) {
-    if (!metrics_collector_) return;
     asternet_response_info_t info{};
     info.result = static_cast<asternet_result_t>(result);
     info.http_status = response.http_status;
@@ -283,7 +335,48 @@ void Client::report_metrics(uint64_t request_id, uint64_t network_epoch,
     metrics.cache_hit = context.dns_cache_hit;
     metrics.deduplicated = context.deduplicated;
     metrics.failure_stage = response.failure_stage;
-    metrics_collector_->report_request(metrics);
+    enqueue_metrics(std::move(metrics), std::move(collector));
+}
+
+void Client::enqueue_metrics(monitor::RequestMetrics metrics,
+                             std::shared_ptr<monitor::MetricsCollector> collector) {
+    {
+        std::lock_guard<std::mutex> lock(metrics_queue_mutex_);
+        constexpr size_t kMaxQueuedMetrics = 256;
+        if (metrics_queue_.size() >= kMaxQueuedMetrics) {
+            metrics_queue_.pop_front();
+        }
+        metrics_queue_.push_back(PendingMetrics{std::move(metrics), std::move(collector)});
+    }
+    metrics_queue_cv_.notify_one();
+}
+
+void Client::metrics_worker_loop() {
+    for (;;) {
+        PendingMetrics pending;
+        {
+            std::unique_lock<std::mutex> lock(metrics_queue_mutex_);
+            metrics_queue_cv_.wait(lock, [this] {
+                return metrics_worker_stop_ || !metrics_queue_.empty();
+            });
+            if (metrics_queue_.empty()) {
+                if (metrics_worker_stop_) return;
+                continue;
+            }
+            pending = std::move(metrics_queue_.front());
+            metrics_queue_.pop_front();
+        }
+        try {
+            if (metrics_shadow_collector_) {
+                metrics_shadow_collector_->report_request(pending.metrics);
+            }
+            if (pending.collector && pending.collector != metrics_shadow_collector_) {
+                pending.collector->report_request(pending.metrics);
+            }
+        } catch (...) {
+            ASTER_LOG_WARN("asternet-client", "metrics report callback failed");
+        }
+    }
 }
 
 const char *Client::failure_stage_for(int result) {

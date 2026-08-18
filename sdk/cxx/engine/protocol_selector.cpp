@@ -134,9 +134,8 @@ int ProtocolSelector::request_with_policy(const Request &req, asternet_protocol_
         return ASTERNET_ERR_INVALID_ARGUMENT;
     }
 
-    ASTER_LOG_INFO("asternet-selector", "==> %s:%d %s %s policy=%d",
-               req.host.c_str(), req.port, req.method.c_str(), req.path.c_str(),
-               static_cast<int>(policy));
+    ASTER_LOG_INFO("asternet-selector", "==> request method=%s policy=%d",
+               req.method.c_str(), static_cast<int>(policy));
 
     int last_error = ASTERNET_ERR_UNSUPPORTED;
     bool degraded = false;
