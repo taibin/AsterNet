@@ -20,6 +20,7 @@ set(ASTERNET_SOURCES
     ${SDK_CXX}/connection/connection_pool.cpp
     ${SDK_CXX}/dns/dns_resolver.cpp
     ${SDK_CXX}/sdt/quality_prober.cpp
+    ${SDK_CXX}/sdt/traceroute.cpp
     ${SDK_CXX}/orchestrator/interceptor.cpp
     ${SDK_CXX}/monitor/metrics.cpp
     ${SDK_CXX}/protocol/protocol.cpp
@@ -49,7 +50,7 @@ if(ASTERNET_ENABLE_XQUIC)
     target_compile_definitions(asternet-jni PRIVATE ASTERNET_ENABLE_XQUIC=1)
 endif()
 
-target_compile_definitions(asternet-jni PRIVATE ASTERNET_EXPORTS=1)
+target_compile_definitions(asternet-jni PRIVATE ASTERNET_EXPORTS=1 ASTERNET_PLATFORM_ANDROID=1)
 target_compile_features(asternet-jni PUBLIC cxx_std_17)
 
 # 16KB 页面大小支持（Android 15+ / API 35+）

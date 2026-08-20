@@ -12,6 +12,7 @@ set(ASTERNET_CORE_SOURCES
     connection/connection_pool.cpp
     dns/dns_resolver.cpp
     sdt/quality_prober.cpp
+    sdt/traceroute.cpp
     orchestrator/interceptor.cpp
     monitor/metrics.cpp
     protocol/protocol.cpp

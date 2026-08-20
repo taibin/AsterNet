@@ -8,6 +8,7 @@
 #define ASTERNET_QUALITY_PROBER_H
 
 #include <cstdint>
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <string>
@@ -35,12 +36,20 @@ enum class NetworkQuality {
 struct QualitySnapshot {
     int score = -1;  // -1 表示样本不足
     NetworkQuality quality = NetworkQuality::kUnknown;
+    asternet_network_t network = ASTERNET_NETWORK_UNKNOWN;
     size_t samples = 0;
+    size_t probe_count = 0;
+    size_t success_samples = 0;
+    size_t failure_samples = 0;
     size_t consecutive_failures = 0;
     size_t total_failures = 0;
     int smoothed_rtt_ms = -1;
     int loss_permil = -1;
     int bandwidth_kbps = -1;
+    int64_t last_probe_ms = 0;
+    int64_t last_success_ms = 0;
+    int64_t last_failure_ms = 0;
+    int64_t last_quality_change_ms = 0;
     int64_t last_sample_ms = 0;
     uint64_t network_epoch = 0;
 };
@@ -51,6 +60,8 @@ int compute_score(const QualitySample &s);
 class QualityProber {
 public:
     virtual ~QualityProber() = default;
+
+    using QualityChangeCallback = std::function<void(const QualitySnapshot &snapshot)>;
 
     // 周期主动探测，更新内部评分
     virtual int probe() = 0;
@@ -63,11 +74,23 @@ public:
 
     virtual QualitySnapshot snapshot() const { return {}; }
     virtual void on_network_change(uint64_t /*network_epoch*/, asternet_network_t /*net*/) {}
+    virtual void set_quality_change_callback(QualityChangeCallback /*callback*/) {}
     virtual std::string dump() const { return "{}"; }
+};
+
+class QualityCallbackSuppressionGuard {
+public:
+    QualityCallbackSuppressionGuard();
+    ~QualityCallbackSuppressionGuard();
+
+    QualityCallbackSuppressionGuard(const QualityCallbackSuppressionGuard &) = delete;
+    QualityCallbackSuppressionGuard &operator=(const QualityCallbackSuppressionGuard &) = delete;
 };
 
 class QualityProberImpl final : public QualityProber {
 public:
+    using QualityChangeCallback = QualityProber::QualityChangeCallback;
+
     struct Config {
         int weak_score_threshold = 40;
         int degraded_score_threshold = 65;
@@ -93,6 +116,7 @@ public:
 
     void observe_sample(bool success, const QualitySample &sample);
     void set_probe_callback(ProbeCallback probe_callback);
+    void set_quality_change_callback(QualityChangeCallback callback) override;
 
 private:
     struct State;

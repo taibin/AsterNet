@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "asternet/asternet.h"
+#include "sdt/quality_prober.h"
 
 namespace asternet {
 namespace dns {
@@ -74,6 +75,8 @@ public:
                                           uint64_t /*network_epoch*/, bool /*success*/,
                                           int /*rtt_ms*/) {}
 
+    virtual void on_quality_change(const sdt::QualitySnapshot & /*snapshot*/) {}
+
     virtual void on_network_change(uint64_t /*network_epoch*/) {}
     virtual std::string dump() const { return "{}"; }
 };
@@ -107,6 +110,7 @@ public:
     void invalidate(const std::string &host = "") override;
     void report_connection_result(const std::string &host, const std::string &ip,
                                   uint64_t network_epoch, bool success, int rtt_ms) override;
+    void on_quality_change(const sdt::QualitySnapshot &snapshot) override;
     void on_network_change(uint64_t network_epoch) override;
     std::string dump() const override;
 

@@ -3,7 +3,7 @@ package io.asternet;
 import org.json.JSONObject;
 
 public final class AsterNet {
-    public static final int ABI_VERSION = 0x00010001;
+    public static final int ABI_VERSION = 0x00010002;
 
     public static final class Policy {
         public static final int AUTO = 0;
@@ -14,6 +14,16 @@ public final class AsterNet {
         public static final int PREFER_HTTP_2 = 5;
 
         private Policy() {}
+    }
+
+    public static final class Network {
+        public static final int UNKNOWN = 0;
+        public static final int NONE = 1;
+        public static final int WIFI = 2;
+        public static final int CELLULAR = 3;
+        public static final int ETHERNET = 4;
+
+        private Network() {}
     }
 
     public static final class Response {
@@ -135,6 +145,14 @@ public final class AsterNet {
             return nativePrefetch(handle, host);
         }
 
+        public synchronized String traceRoute(String host, int port) {
+            return nativeTraceRoute(handle, host, port);
+        }
+
+        public synchronized String dumpDiagnostics() {
+            return nativeDumpDiagnostics(handle);
+        }
+
         public synchronized void onNetworkChange(int network) {
             nativeOnNetworkChange(handle, network);
         }
@@ -167,6 +185,8 @@ public final class AsterNet {
                                                int timeoutMs, boolean idempotent,
                                                boolean allowInsecure);
     private static native int nativePrefetch(long handle, String host);
+    private static native String nativeTraceRoute(long handle, String host, int port);
+    private static native String nativeDumpDiagnostics(long handle);
     private static native void nativeOnNetworkChange(long handle, int network);
 
     public static Client createClient(boolean enableH3, String caCertPem) {

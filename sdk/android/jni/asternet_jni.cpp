@@ -133,6 +133,32 @@ Java_io_asternet_AsterNet_nativePrefetch(JNIEnv *env, jclass /*clazz*/, jlong ha
     return asternet_client_prefetch(reinterpret_cast<asternet_client_t *>(handle), host.get());
 }
 
+JNIEXPORT jstring JNICALL
+Java_io_asternet_AsterNet_nativeTraceRoute(JNIEnv *env, jclass /*clazz*/, jlong handle,
+                                           jstring jhost, jint port) {
+    UtfChars host(env, jhost);
+    if (host.get() == nullptr || port <= 0 || port > UINT16_MAX) {
+        return env->NewStringUTF("{}");
+    }
+    std::vector<char> buffer(64 * 1024);
+    const size_t size = asternet_client_trace_route(reinterpret_cast<asternet_client_t *>(handle),
+                                                    host.get(), static_cast<uint16_t>(port),
+                                                    buffer.data(), buffer.size());
+    if (size == 0) return env->NewStringUTF("{}");
+    if (size >= buffer.size() - 1) return env->NewStringUTF("{\"error\":\"TRUNCATED\"}");
+    return env->NewStringUTF(buffer.data());
+}
+
+JNIEXPORT jstring JNICALL
+Java_io_asternet_AsterNet_nativeDumpDiagnostics(JNIEnv *env, jclass /*clazz*/, jlong handle) {
+    std::vector<char> buffer(64 * 1024);
+    const size_t size = asternet_client_dump_diagnostics(
+        reinterpret_cast<asternet_client_t *>(handle), buffer.data(), buffer.size());
+    if (size == 0) return env->NewStringUTF("{}");
+    if (size >= buffer.size() - 1) return env->NewStringUTF("{\"error\":\"TRUNCATED\"}");
+    return env->NewStringUTF(buffer.data());
+}
+
 JNIEXPORT void JNICALL
 Java_io_asternet_AsterNet_nativeOnNetworkChange(JNIEnv * /*env*/, jclass /*clazz*/, jlong handle,
                                                 jint network) {

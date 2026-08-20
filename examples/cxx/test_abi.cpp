@@ -9,6 +9,18 @@
 #include <cstdio>
 #include <cstring>
 
+namespace {
+
+void quality_callback(const asternet_quality_snapshot_t *snapshot, void *user_data) {
+    int *calls = static_cast<int *>(user_data);
+    assert(snapshot != nullptr);
+    assert(snapshot->quality >= ASTERNET_QUALITY_UNKNOWN);
+    assert(snapshot->quality <= ASTERNET_QUALITY_OFFLINE);
+    ++*calls;
+}
+
+}  // namespace
+
 int main() {
     // 1. 版本字符串一致
     assert(std::strcmp(asternet_version(), ASTERNET_VERSION_STRING) == 0);
@@ -42,12 +54,25 @@ int main() {
     assert(buf[n] == '\0');
 
     // 6. 网络变化通知（stub 阶段不应崩溃）
+    int quality_calls = 0;
+    asternet_client_set_quality_callback(c, quality_callback, &quality_calls);
+    assert(quality_calls == 1);
     asternet_client_on_network_change(c, ASTERNET_NETWORK_WIFI);
+    assert(quality_calls == 2);
 
     // 7. prefetch 入口不应崩溃；物理预连接未实现时必须明确返回 UNSUPPORTED。
     asternet_result_t prefetch = asternet_client_prefetch(c, "203.0.113.20");
     assert(prefetch == ASTERNET_OK);
     assert(asternet_client_prefetch(c, "") == ASTERNET_ERR_INVALID_ARGUMENT);
+
+    char trace[512];
+    size_t trace_size = asternet_client_trace_route(c, "127.0.0.1", 443,
+                                                    trace, sizeof(trace));
+    assert(trace_size > 0 && trace_size < sizeof(trace));
+    assert(std::strstr(trace, "\"host\":\"127.0.0.1\"") != nullptr);
+    assert(std::strstr(trace, "\"hops\"") != nullptr);
+    assert(quality_calls == 2);
+    assert(asternet_client_trace_route(c, "", 443, trace, sizeof(trace)) == 0);
 
     // destroy 本身幂等，空句柄也应安全处理。
     asternet_client_destroy(c);

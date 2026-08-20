@@ -92,6 +92,37 @@ void test_dns() {
     assert(fallback.error == ASTERNET_OK);
     assert(fallback.addresses.size() == 1);
     assert(fallback.addresses.front().ip == "203.0.113.20");
+
+    int live_lookup_calls = 0;
+    SmartDnsResolverImpl quality_resolver({}, [&live_lookup_calls](const std::string &) {
+        ++live_lookup_calls;
+        return std::vector<IpResult>{{"192.0.2.30"}};
+    });
+    asternet::sdt::QualitySnapshot offline_quality;
+    offline_quality.quality = asternet::sdt::NetworkQuality::kOffline;
+    quality_resolver.on_quality_change(offline_quality);
+    quality_resolver.set_backup_ips("offline.example.test", {{"203.0.113.30"}});
+    auto offline = quality_resolver.resolve_with_metadata("offline.example.test", 2, 1);
+    assert(offline.error == ASTERNET_OK);
+    assert(offline.addresses.size() == 1);
+    assert(offline.addresses.front().ip == "203.0.113.30");
+    assert(live_lookup_calls == 0);
+
+    SmartDnsResolverImpl weak_resolver({}, [](const std::string &) {
+        return std::vector<IpResult>{{"192.0.2.40"}, {"192.0.2.41"}};
+    });
+    asternet::sdt::QualitySnapshot bad_quality;
+    bad_quality.quality = asternet::sdt::NetworkQuality::kBad;
+    weak_resolver.on_quality_change(bad_quality);
+    weak_resolver.report_connection_result("weak.example.test", "192.0.2.41", 3, true, 120);
+    auto weak = weak_resolver.resolve_with_metadata("weak.example.test", 3);
+    assert(weak.error == ASTERNET_OK);
+    assert(weak.addresses.size() == 2);
+    assert(weak.addresses.front().ip == "192.0.2.41");
+
+    auto weak_cached = weak_resolver.resolve_with_metadata("weak.example.test", 3);
+    assert(weak_cached.cache_hit);
+    assert(weak_cached.addresses.front().ip == "192.0.2.41");
 }
 
 void test_connection_pool() {
@@ -128,15 +159,86 @@ void test_connection_pool() {
 
 void test_quality() {
     assert(asternet::sdt::compute_score({}) == -1);
-    asternet::sdt::QualityProberImpl prober;
-    prober.observe(true, 80);
-    assert(prober.current_score() >= 0);
-    prober.observe(false, -1);
-    prober.observe(false, -1);
-    assert(prober.is_weak_net());
-    assert(prober.snapshot().loss_permil > 0);
-    prober.on_network_change(7, ASTERNET_NETWORK_WIFI);
-    assert(prober.snapshot().quality == asternet::sdt::NetworkQuality::kUnknown);
+    auto prober = std::make_shared<asternet::sdt::QualityProberImpl>();
+    int quality_changes = 0;
+    asternet::sdt::QualitySnapshot last_snapshot;
+    prober->set_quality_change_callback([&](const asternet::sdt::QualitySnapshot &snapshot) {
+        ++quality_changes;
+        last_snapshot = snapshot;
+    });
+
+    prober->observe(true, 80);
+    assert(prober->current_score() >= 0);
+    assert(quality_changes == 1);
+    assert(last_snapshot.quality == asternet::sdt::NetworkQuality::kGood);
+
+    prober->observe(false, -1);
+    prober->observe(false, -1);
+    assert(prober->is_weak_net());
+    assert(prober->snapshot().loss_permil > 0);
+    assert(last_snapshot.quality == asternet::sdt::NetworkQuality::kBad);
+
+    prober->on_network_change(7, ASTERNET_NETWORK_NONE);
+    assert(prober->snapshot().quality == asternet::sdt::NetworkQuality::kOffline);
+    assert(last_snapshot.quality == asternet::sdt::NetworkQuality::kOffline);
+
+    asternet::orchestrator::RequestOrchestrator offline_orchestrator(prober);
+    asternet::orchestrator::RequestContext offline_context;
+    offline_context.request.host = "api.example.test";
+    offline_context.request.method = "GET";
+    offline_context.request.idempotent = true;
+    offline_context.request.retry_safe = true;
+    offline_context.request.timeout_ms = 2000;
+    offline_context.max_retries = 3;
+    asternet::engine::Response offline_response;
+    assert(offline_orchestrator.execute(offline_context, offline_response,
+        [](asternet::orchestrator::RequestContext &, asternet::engine::Response &result) -> int {
+            result.err_code = ASTERNET_OK;
+            result.http_status = 200;
+            return ASTERNET_OK;
+        }) == ASTERNET_OK);
+    assert(offline_context.weak_network);
+    assert(offline_context.max_retries == 0);
+
+    prober->on_network_change(8, ASTERNET_NETWORK_WIFI);
+    assert(prober->snapshot().quality == asternet::sdt::NetworkQuality::kUnknown);
+
+    prober->observe(false, -1);
+    prober->observe(false, -1);
+    assert(prober->is_weak_net());
+    assert(last_snapshot.quality == asternet::sdt::NetworkQuality::kBad);
+
+    asternet::orchestrator::RequestOrchestrator orchestrator(prober);
+    asternet::orchestrator::RequestContext context;
+    context.request.host = "api.example.test";
+    context.request.method = "GET";
+    context.request.idempotent = true;
+    context.request.retry_safe = true;
+    context.request.timeout_ms = 2000;
+    context.max_retries = 3;
+    asternet::engine::Response response;
+    assert(orchestrator.execute(context, response,
+        [](asternet::orchestrator::RequestContext &, asternet::engine::Response &result) -> int {
+            result.err_code = ASTERNET_OK;
+            result.http_status = 200;
+            return ASTERNET_OK;
+        }) == ASTERNET_OK);
+    assert(context.weak_network);
+    assert(context.max_retries == 1);
+}
+
+void test_client_diagnostics() {
+    asternet_client_config_t config{};
+    config.struct_size = sizeof(config);
+    config.abi_version = ASTERNET_ABI_VERSION;
+    asternet::Client client(config);
+    const std::string before = client.dump_diag();
+    const std::string trace = client.trace_route("127.0.0.1", 443);
+    const std::string after = client.dump_diag();
+    assert(trace.find("\"host\":\"127.0.0.1\"") != std::string::npos);
+    assert(trace.find("\"hops\"") != std::string::npos);
+    assert(before.find("\"samples\":0") != std::string::npos);
+    assert(after.find("\"samples\":0") != std::string::npos);
 }
 
 void test_protocol_selector() {
@@ -347,6 +449,7 @@ int main() {
     test_dns();
     test_connection_pool();
     test_quality();
+    test_client_diagnostics();
     test_protocol_selector();
     test_orchestrator_and_metrics();
     test_protocol_codec();

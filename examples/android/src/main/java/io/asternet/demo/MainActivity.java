@@ -41,7 +41,7 @@ public final class MainActivity extends AppCompatActivity {
         viewPager.setAdapter(new FragmentsAdapter(this));
 
         new TabLayoutMediator(tabLayout, viewPager, (tab, position) -> {
-            tab.setText(position == 0 ? "Presets" : "Custom");
+            tab.setText(position == 0 ? "Presets" : position == 1 ? "Custom" : "Diagnostics");
         }).attach();
 
         Log.i(TAG, "AsterNet Demo starting, native version: " + AsterNet.nativeVersion());
@@ -141,12 +141,14 @@ public final class MainActivity extends AppCompatActivity {
         @NonNull
         @Override
         public Fragment createFragment(int position) {
-            return position == 0 ? new ScenariosFragment() : new CustomRequestFragment();
+            if (position == 0) return new ScenariosFragment();
+            if (position == 1) return new CustomRequestFragment();
+            return new DiagnosticsFragment();
         }
 
         @Override
         public int getItemCount() {
-            return 2;
+            return 3;
         }
     }
 }

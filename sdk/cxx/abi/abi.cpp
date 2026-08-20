@@ -291,6 +291,20 @@ ASTERNET_API asternet_result_t asternet_client_prefetch(asternet_client_t *clien
     }
 }
 
+ASTERNET_API void asternet_client_set_quality_callback(asternet_client_t *client,
+                                                       asternet_quality_callback_t callback,
+                                                       void *user_data) {
+    try {
+        std::shared_ptr<ClientHandle> handle;
+        auto owned_client = acquire_client(client, handle);
+        if (owned_client == nullptr) return;
+        ClientLease lease{handle};
+        owned_client->set_quality_change_callback(callback, user_data);
+    } catch (...) {
+        // 质量回调注册失败时保持旧状态，不允许异常越过 C ABI。
+    }
+}
+
 ASTERNET_API asternet_result_t asternet_client_request_sync(
     asternet_client_t *client, const asternet_request_t *request, uint8_t *out_body,
     size_t out_body_capacity, asternet_response_info_t *out_info) {
@@ -392,6 +406,28 @@ ASTERNET_API size_t asternet_client_dump_diagnostics(asternet_client_t *client, 
         if (owned_client == nullptr) return 0;
         ClientLease lease{handle};
         diagnostics = owned_client->dump_diag();
+    } catch (...) {
+        diagnostics = "{\"error\":\"OUT_OF_MEMORY\"}";
+    }
+    const size_t copied = diagnostics.size() < out_capacity - 1
+        ? diagnostics.size()
+        : out_capacity - 1;
+    std::memcpy(out_buffer, diagnostics.data(), copied);
+    out_buffer[copied] = '\0';
+    return copied;
+}
+
+ASTERNET_API size_t asternet_client_trace_route(asternet_client_t *client, const char *host,
+                                                uint16_t port, char *out_buffer,
+                                                size_t out_capacity) {
+    if (out_buffer == nullptr || out_capacity == 0 || !valid_host(host) || port == 0) return 0;
+    std::string diagnostics;
+    try {
+        std::shared_ptr<ClientHandle> handle;
+        auto owned_client = acquire_client(client, handle);
+        if (owned_client == nullptr) return 0;
+        ClientLease lease{handle};
+        diagnostics = owned_client->trace_route(host, port);
     } catch (...) {
         diagnostics = "{\"error\":\"OUT_OF_MEMORY\"}";
     }

@@ -152,10 +152,15 @@ int RetryInterceptor::intercept(Chain &chain, RequestContext &context, engine::R
 
 int WeakNetInterceptor::intercept(Chain &chain, RequestContext &context,
                                   engine::Response &response) {
-    if (prober_ && prober_->is_weak_net()) {
-        context.weak_network = true;
-        // Do not force H3 or extend caller deadline. Restrict retry amplification under weak links.
-        context.max_retries = std::min(context.max_retries, 1);
+    if (prober_) {
+        const bool weak_link = prober_->is_weak_net();
+        context.weak_network = weak_link;
+        if (weak_link) {
+            const asternet::sdt::QualitySnapshot snapshot = prober_->snapshot();
+            // Do not force H3 or extend caller deadline. Restrict retry amplification under weak links.
+            context.max_retries = snapshot.quality == asternet::sdt::NetworkQuality::kOffline
+                ? 0 : std::min(context.max_retries, 1);
+        }
     }
     return chain.proceed(context, response);
 }

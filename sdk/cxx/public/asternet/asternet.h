@@ -15,7 +15,7 @@ extern "C" {
 #endif
 
 #define ASTERNET_ABI_VERSION_MAJOR 1
-#define ASTERNET_ABI_VERSION_MINOR 1
+#define ASTERNET_ABI_VERSION_MINOR 2
 #define ASTERNET_ABI_VERSION \
     ((ASTERNET_ABI_VERSION_MAJOR << 16) | ASTERNET_ABI_VERSION_MINOR)
 
@@ -64,6 +64,14 @@ typedef enum {
     ASTERNET_NETWORK_ETHERNET = 4,
 } asternet_network_t;
 
+typedef enum {
+    ASTERNET_QUALITY_UNKNOWN = 0,
+    ASTERNET_QUALITY_GOOD = 1,
+    ASTERNET_QUALITY_DEGRADED = 2,
+    ASTERNET_QUALITY_BAD = 3,
+    ASTERNET_QUALITY_OFFLINE = 4,
+} asternet_quality_t;
+
 typedef struct {
     const char *name;
     const char *value;
@@ -111,8 +119,28 @@ typedef struct {
     int64_t total_ms;
 } asternet_response_info_t;
 
+typedef struct {
+    int score;
+    asternet_quality_t quality;
+    asternet_network_t network;
+    size_t samples;
+    size_t probe_count;
+    size_t success_samples;
+    size_t failure_samples;
+    size_t consecutive_failures;
+    size_t total_failures;
+    int smoothed_rtt_ms;
+    int loss_permil;
+    int bandwidth_kbps;
+    int64_t last_quality_change_ms;
+    int64_t last_sample_ms;
+    uint64_t network_epoch;
+} asternet_quality_snapshot_t;
+
 typedef void (*asternet_log_callback_t)(int level, const char *tag, const char *message,
                                         void *user_data);
+typedef void (*asternet_quality_callback_t)(const asternet_quality_snapshot_t *snapshot,
+                                            void *user_data);
 
 asternet_client_t *asternet_client_create(const asternet_client_config_t *config,
                                            asternet_result_t *out_error);
@@ -122,6 +150,9 @@ void asternet_client_on_network_change(asternet_client_t *client,
 // Warms DNS for host and attempts transport preconnect when available. Transport preconnect support
 // is best-effort; diagnostics expose the last transport prefetch result.
 asternet_result_t asternet_client_prefetch(asternet_client_t *client, const char *host);
+void asternet_client_set_quality_callback(asternet_client_t *client,
+                                          asternet_quality_callback_t callback,
+                                          void *user_data);
 
 /*
  * Executes a request synchronously.
@@ -136,6 +167,8 @@ asternet_result_t asternet_client_request_sync(
 
 size_t asternet_client_dump_diagnostics(asternet_client_t *client, char *out_buffer,
                                         size_t out_capacity);
+size_t asternet_client_trace_route(asternet_client_t *client, const char *host, uint16_t port,
+                                   char *out_buffer, size_t out_capacity);
 void asternet_set_log_callback(asternet_log_callback_t callback, void *user_data, int level);
 const char *asternet_version(void);
 const char *asternet_result_string(asternet_result_t result);

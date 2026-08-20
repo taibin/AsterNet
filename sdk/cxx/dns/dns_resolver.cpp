@@ -187,6 +187,7 @@ struct SmartDnsResolverImpl::State {
     std::unordered_map<std::string, CacheEntry> cache;
     std::unordered_map<std::string, Health> health;
     std::unordered_map<std::string, std::vector<IpResult>> backup_ips;
+    sdt::QualitySnapshot quality;
     uint64_t last_network_epoch = 0;
     size_t active_lookups = 0;
 };
@@ -232,6 +233,7 @@ ResolveResult SmartDnsResolverImpl::resolve_with_metadata(const std::string &hos
     State::CacheEntry stale_entry;
     bool has_stale_entry = false;
     HttpDnsLookup httpdns_lookup;
+    std::vector<IpResult> addresses;
     std::vector<IpResult> backup_ips;
     Config config;
     {
@@ -240,10 +242,8 @@ ResolveResult SmartDnsResolverImpl::resolve_with_metadata(const std::string &hos
         if (cached != state_->cache.end()) {
             const int64_t now_ms = monotonic_ms();
             if (now_ms <= cached->second.expires_at_ms) {
-                result.addresses = cached->second.addresses;
+                addresses = cached->second.addresses;
                 result.cache_hit = true;
-                result.elapsed_ms = monotonic_ms() - started_ms;
-                return result;
             }
             stale_entry = cached->second;
             has_stale_entry = now_ms <= cached->second.stale_until_ms;
@@ -303,8 +303,14 @@ ResolveResult SmartDnsResolverImpl::resolve_with_metadata(const std::string &hos
         return true;
     };
 
-    std::vector<IpResult> addresses;
-    if (httpdns_lookup && monotonic_ms() < deadline_ms) {
+    sdt::QualitySnapshot quality_snapshot;
+    bool allow_live_lookup = true;
+    {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        quality_snapshot = state_->quality;
+        allow_live_lookup = quality_snapshot.quality != sdt::NetworkQuality::kOffline;
+    }
+    if (addresses.empty() && httpdns_lookup && monotonic_ms() < deadline_ms && allow_live_lookup) {
         run_bounded_lookup([httpdns_lookup, host] { return httpdns_lookup(host); }, addresses);
         addresses.erase(std::remove_if(addresses.begin(), addresses.end(), [&config](IpResult &item) {
             bool ipv6 = false;
@@ -315,13 +321,17 @@ ResolveResult SmartDnsResolverImpl::resolve_with_metadata(const std::string &hos
         }), addresses.end());
     }
 
-    if (addresses.empty() && monotonic_ms() < deadline_ms) {
+    if (addresses.empty() && monotonic_ms() < deadline_ms && allow_live_lookup) {
         run_bounded_lookup([host, allow_private = config.allow_private_addresses] {
             return resolve_local(host, allow_private);
         }, addresses);
     }
 
     if (addresses.empty()) addresses = std::move(backup_ips);
+    if (addresses.empty() && has_stale_entry) {
+        addresses = stale_entry.addresses;
+        result.cache_hit = true;
+    }
     addresses.erase(std::remove_if(addresses.begin(), addresses.end(), [&config](IpResult &item) {
         bool ipv6 = false;
         if (!is_safe_ip(item.ip, config.allow_private_addresses, &ipv6)) return true;
@@ -334,18 +344,31 @@ ResolveResult SmartDnsResolverImpl::resolve_with_metadata(const std::string &hos
 
     {
         std::lock_guard<std::mutex> lock(state_->mutex);
+        quality_snapshot = state_->quality;
         const int64_t now_ms = monotonic_ms();
         for (IpResult &item : addresses) {
             const auto health = state_->health.find(health_key(host, item.ip, network_epoch));
             const State::Health *entry = health == state_->health.end() ? nullptr : &health->second;
             const int rtt = entry != nullptr && entry->rtt_ms >= 0 ? entry->rtt_ms : item.rtt_ms;
             const int failures = entry != nullptr ? entry->failures : 0;
+            const int successes = entry != nullptr ? entry->successes : 0;
             const int loss = item.loss_rate < 0 ? 0 : item.loss_rate;
+            int quality_penalty = 0;
+            switch (quality_snapshot.quality) {
+            case sdt::NetworkQuality::kGood: quality_penalty = 0; break;
+            case sdt::NetworkQuality::kDegraded: quality_penalty = rtt < 0 ? 300 : 100; break;
+            case sdt::NetworkQuality::kBad: quality_penalty = rtt < 0 ? 700 : 250; break;
+            case sdt::NetworkQuality::kOffline: quality_penalty = rtt < 0 ? 1000 : 500; break;
+            case sdt::NetworkQuality::kUnknown: quality_penalty = 50; break;
+            }
+            const int success_bonus = quality_snapshot.quality == sdt::NetworkQuality::kGood
+                ? 0 : std::min(500, successes * 100);
             // 高分优先：失败会比单次 RTT 更强地降低排序，避免反复命中坏地址。
             item.rtt_ms = rtt;
             const int rtt_penalty = rtt < 0 ? 500 : std::min(8000, rtt * 2);
             item.score = 10000 - rtt_penalty
-                       - std::min(2000, loss * 2) - std::min(4000, failures * 500);
+                       - std::min(2000, loss * 2) - std::min(4000, failures * 500)
+                       - quality_penalty + success_bonus;
         }
         std::stable_sort(addresses.begin(), addresses.end(), [](const IpResult &left,
                                                                   const IpResult &right) {
@@ -360,9 +383,6 @@ ResolveResult SmartDnsResolverImpl::resolve_with_metadata(const std::string &hos
             }
             state_->cache[key] = {addresses, now_ms + state_->config.ttl_ms,
                                   now_ms + state_->config.ttl_ms + state_->config.stale_ttl_ms};
-        } else if (has_stale_entry) {
-            addresses = stale_entry.addresses;
-            result.cache_hit = true;
         }
     }
 
@@ -398,8 +418,8 @@ void SmartDnsResolverImpl::invalidate(const std::string &host) {
 }
 
 void SmartDnsResolverImpl::report_connection_result(const std::string &host, const std::string &ip,
-                                                     uint64_t network_epoch, bool success,
-                                                     int rtt_ms) {
+                                                      uint64_t network_epoch, bool success,
+                                                      int rtt_ms) {
     if (host.empty() || ip.empty()) return;
     std::lock_guard<std::mutex> lock(state_->mutex);
     const std::string key = health_key(host, ip, network_epoch);
@@ -425,6 +445,11 @@ void SmartDnsResolverImpl::report_connection_result(const std::string &host, con
     } else {
         ++health.failures;
     }
+}
+
+void SmartDnsResolverImpl::on_quality_change(const sdt::QualitySnapshot &snapshot) {
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    state_->quality = snapshot;
 }
 
 void SmartDnsResolverImpl::on_network_change(uint64_t network_epoch) {

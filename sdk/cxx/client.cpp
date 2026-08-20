@@ -6,11 +6,13 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <iomanip>
 #include <vector>
 #include <sstream>
 
 #include "asternet/version.h"
 #include "platform/log.h"
+#include "sdt/traceroute.h"
 
 namespace asternet {
 
@@ -51,6 +53,29 @@ bool is_replayable_safe_method(const engine::Request &request) {
     return method == "GET" || method == "HEAD" || method == "OPTIONS";
 }
 
+asternet_quality_t to_public_quality(sdt::NetworkQuality quality) {
+    switch (quality) {
+    case sdt::NetworkQuality::kGood: return ASTERNET_QUALITY_GOOD;
+    case sdt::NetworkQuality::kDegraded: return ASTERNET_QUALITY_DEGRADED;
+    case sdt::NetworkQuality::kBad: return ASTERNET_QUALITY_BAD;
+    case sdt::NetworkQuality::kOffline: return ASTERNET_QUALITY_OFFLINE;
+    case sdt::NetworkQuality::kUnknown: return ASTERNET_QUALITY_UNKNOWN;
+    }
+    return ASTERNET_QUALITY_UNKNOWN;
+}
+
+asternet_network_t to_public_network(asternet_network_t network) {
+    switch (network) {
+    case ASTERNET_NETWORK_NONE:
+    case ASTERNET_NETWORK_WIFI:
+    case ASTERNET_NETWORK_CELLULAR:
+    case ASTERNET_NETWORK_ETHERNET:
+    case ASTERNET_NETWORK_UNKNOWN:
+        return network;
+    }
+    return ASTERNET_NETWORK_UNKNOWN;
+}
+
 std::shared_ptr<monitor::MetricsCollector> make_default_metrics_collector() {
     return std::make_shared<monitor::MetricsCollectorImpl>();
 }
@@ -86,10 +111,6 @@ Client::Client(const asternet_client_config_t &cfg)
     std::weak_ptr<engine::NetworkEngine> h1 = h1_engine_;
     std::weak_ptr<engine::NetworkEngine> h2 = h2_engine_;
     std::weak_ptr<engine::NetworkEngine> h3 = h3_engine_;
-    pool->set_prefetch_handler([h3](const std::string &host) {
-        const std::shared_ptr<engine::NetworkEngine> engine = h3.lock();
-        return engine ? engine->prefetch(host) : ASTERNET_ERR_UNSUPPORTED;
-    });
     pool->set_migration_handler([h1, h2, h3] {
         int result = ASTERNET_ERR_UNSUPPORTED;
         if (const std::shared_ptr<engine::NetworkEngine> engine = h1.lock()) {
@@ -105,8 +126,17 @@ Client::Client(const asternet_client_config_t &cfg)
         }
         return result;
     });
-    connection_pool_ = std::move(pool);
     quality_prober_ = std::make_shared<sdt::QualityProberImpl>();
+    quality_callback_state_ = std::make_shared<QualityCallbackState>();
+    last_quality_snapshot_ = quality_prober_->snapshot();
+    pool->set_prefetch_handler([h3, prober = quality_prober_](const std::string &host) -> int {
+        const std::shared_ptr<engine::NetworkEngine> engine = h3.lock();
+        if (!engine) return ASTERNET_ERR_UNSUPPORTED;
+        const sdt::QualitySnapshot quality = prober ? prober->snapshot() : sdt::QualitySnapshot{};
+        if (quality.quality == sdt::NetworkQuality::kOffline) return ASTERNET_ERR_DEGRADED;
+        return engine->prefetch(host);
+    });
+    connection_pool_ = std::move(pool);
     orchestrator_ = std::make_unique<orchestrator::RequestOrchestrator>(quality_prober_);
     metrics_shadow_collector_ = make_default_metrics_collector();
     metrics_collector_ = metrics_shadow_collector_;
@@ -143,17 +173,38 @@ Client::~Client() {
 
 void Client::on_network_change(asternet_network_t net) {
     if (is_active_client(this)) return;
-    std::shared_lock<std::shared_mutex> lock(lifecycle_mutex_);
-    if (destroyed_.load(std::memory_order_acquire)) return;
-    const uint64_t epoch = network_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
-    if (connection_pool_) {
-        connection_pool_->on_network_change(epoch, net);
+    std::shared_ptr<connection::ConnectionPool> connection_pool;
+    sdt::QualitySnapshot before_quality;
+    sdt::QualitySnapshot after_quality;
+    uint64_t epoch = 0;
+    {
+        std::unique_lock<std::shared_mutex> lock(lifecycle_mutex_);
+        if (destroyed_.load(std::memory_order_acquire)) return;
+        before_quality = quality_prober_ ? quality_prober_->snapshot() : sdt::QualitySnapshot{};
+        epoch = network_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
+        connection_pool = connection_pool_;
+        if (quality_prober_) {
+            [[maybe_unused]] sdt::QualityCallbackSuppressionGuard quality_guard;
+            quality_prober_->on_network_change(epoch, net);
+            after_quality = quality_prober_->snapshot();
+            last_quality_snapshot_ = after_quality;
+        }
+        if (connection_pool_) connection_pool_->on_network_change(epoch, net);
+        if (dns_resolver_) {
+            dns_resolver_->on_network_change(epoch);
+            dns_resolver_->on_quality_change(after_quality);
+        }
+    }
+    if (connection_pool) {
         // This returns UNSUPPORTED until the H3 engine owns persistent connections. Cache and
         // lease invalidation above is still required for every transport.
-        (void)connection_pool_->migrate(net);
+        (void)connection_pool->migrate(net);
     }
-    if (dns_resolver_) dns_resolver_->on_network_change(epoch);
-    if (quality_prober_) quality_prober_->on_network_change(epoch, net);
+    if (after_quality.network_epoch != before_quality.network_epoch
+        || after_quality.network != before_quality.network
+        || after_quality.quality != before_quality.quality) {
+        publish_quality_change(after_quality);
+    }
 }
 
 std::string Client::dump_diag() const {
@@ -191,10 +242,14 @@ int Client::prefetch(const std::string &host) {
     if (host.empty()) return ASTERNET_ERR_INVALID_ARGUMENT;
     std::shared_lock<std::shared_mutex> lock(lifecycle_mutex_);
     if (destroyed_.load(std::memory_order_acquire)) return ASTERNET_ERR_CANCELED;
+    const sdt::QualitySnapshot quality = quality_prober_ ? quality_prober_->snapshot()
+                                                         : sdt::QualitySnapshot{};
     int dns_result = ASTERNET_OK;
     if (dns_resolver_) dns_result = dns_resolver_->prefetch(
         host, network_epoch_.load(std::memory_order_acquire));
-    if (connection_pool_) (void)connection_pool_->prefetch(host);
+    if (connection_pool_ && quality.quality != sdt::NetworkQuality::kOffline) {
+        (void)connection_pool_->prefetch(host);
+    }
     return dns_result;
 }
 
@@ -223,11 +278,15 @@ int Client::request_with_policy(const engine::Request &req, asternet_protocol_po
     const int64_t started_ms = monotonic_ms();
     orchestrator::RequestContext context;
     std::shared_ptr<monitor::MetricsCollector> metrics_collector;
+    [[maybe_unused]] sdt::QualityCallbackSuppressionGuard quality_guard;
+    sdt::QualitySnapshot before_quality;
+    sdt::QualitySnapshot after_quality;
     int ret = ASTERNET_ERR_INTERNAL;
     {
         std::shared_lock<std::shared_mutex> lock(lifecycle_mutex_);
         if (destroyed_.load(std::memory_order_acquire)) return ASTERNET_ERR_CANCELED;
         if (!selector_ || !orchestrator_) return ASTERNET_ERR_INTERNAL;
+        before_quality = quality_prober_ ? quality_prober_->snapshot() : sdt::QualitySnapshot{};
 
         context.request = req;
         context.request.allow_insecure_tls_for_testing = false;
@@ -242,7 +301,8 @@ int Client::request_with_policy(const engine::Request &req, asternet_protocol_po
         context.deadline_ms = started_ms + context.request.timeout_ms;
 
         ret = orchestrator_->execute(context, resp,
-            [this](orchestrator::RequestContext &request_context, engine::Response &response) {
+            [this](orchestrator::RequestContext &request_context,
+                    engine::Response &response) {
                 return execute_transport(request_context, response);
             });
         if (resp.total_ms < 0) resp.total_ms = monotonic_ms() - started_ms;
@@ -252,11 +312,92 @@ int Client::request_with_policy(const engine::Request &req, asternet_protocol_po
         resp.attempts = std::max(resp.attempts, context.attempts);
         if (out_actual_proto) *out_actual_proto = resp.protocol;
         if (out_degraded) *out_degraded = resp.degraded;
+        after_quality = quality_prober_ ? quality_prober_->snapshot() : sdt::QualitySnapshot{};
         metrics_collector = metrics_collector_;
         report_metrics(std::move(metrics_collector), context.request_id, context.network_epoch,
                        context, resp, ret);
     }
+    if (after_quality.network_epoch != before_quality.network_epoch
+        || after_quality.network != before_quality.network
+        || after_quality.quality != before_quality.quality
+        || after_quality.score != before_quality.score
+        || after_quality.samples != before_quality.samples
+        || after_quality.total_failures != before_quality.total_failures) {
+        publish_quality_change(after_quality);
+    }
     return ret;
+}
+
+void Client::set_quality_change_callback(asternet_quality_callback_t callback, void *user_data) {
+    sdt::QualitySnapshot snapshot;
+    {
+        std::unique_lock<std::shared_mutex> lock(lifecycle_mutex_);
+        if (destroyed_.load(std::memory_order_acquire)) return;
+        if (!quality_callback_state_) {
+            quality_callback_state_ = std::make_shared<QualityCallbackState>();
+        }
+        quality_callback_state_->callback = callback;
+        quality_callback_state_->user_data = user_data;
+        snapshot = last_quality_snapshot_;
+    }
+    if (callback != nullptr) {
+        publish_quality_change(snapshot);
+    }
+}
+
+void Client::publish_quality_change(const sdt::QualitySnapshot &snapshot) {
+    asternet_quality_callback_t callback = nullptr;
+    void *callback_user_data = nullptr;
+    std::shared_ptr<dns::SmartDnsResolver> dns_resolver;
+    {
+        std::unique_lock<std::shared_mutex> lock(lifecycle_mutex_);
+        if (destroyed_.load(std::memory_order_acquire)) return;
+        if (snapshot.network_epoch < last_quality_snapshot_.network_epoch) return;
+        if (snapshot.network_epoch == last_quality_snapshot_.network_epoch
+            && snapshot.last_sample_ms < last_quality_snapshot_.last_sample_ms) {
+            return;
+        }
+        last_quality_snapshot_ = snapshot;
+        if (quality_callback_state_) {
+            callback = quality_callback_state_->callback;
+            callback_user_data = quality_callback_state_->user_data;
+        }
+        dns_resolver = dns_resolver_;
+    }
+
+    if (dns_resolver) {
+        dns_resolver->on_quality_change(snapshot);
+    }
+    if (callback) {
+        asternet_quality_snapshot_t public_snapshot{};
+        public_snapshot.score = snapshot.score;
+        public_snapshot.quality = to_public_quality(snapshot.quality);
+        public_snapshot.network = to_public_network(snapshot.network);
+        public_snapshot.samples = snapshot.samples;
+        public_snapshot.probe_count = snapshot.probe_count;
+        public_snapshot.success_samples = snapshot.success_samples;
+        public_snapshot.failure_samples = snapshot.failure_samples;
+        public_snapshot.consecutive_failures = snapshot.consecutive_failures;
+        public_snapshot.total_failures = snapshot.total_failures;
+        public_snapshot.smoothed_rtt_ms = snapshot.smoothed_rtt_ms;
+        public_snapshot.loss_permil = snapshot.loss_permil;
+        public_snapshot.bandwidth_kbps = snapshot.bandwidth_kbps;
+        public_snapshot.last_quality_change_ms = snapshot.last_quality_change_ms;
+        public_snapshot.last_sample_ms = snapshot.last_sample_ms;
+        public_snapshot.network_epoch = snapshot.network_epoch;
+        try {
+            callback(&public_snapshot, callback_user_data);
+        } catch (...) {
+            // 外部回调异常必须被完全隔离，不能再通过日志回调影响请求结果。
+        }
+    }
+}
+
+std::string Client::trace_route(const std::string &host, uint16_t port) {
+    if (host.empty() || port == 0) return "{}";
+    std::shared_lock<std::shared_mutex> lock(lifecycle_mutex_);
+    if (destroyed_.load(std::memory_order_acquire)) return "{}";
+    return sdt::trace_route_json(host, port);
 }
 
 int Client::execute_transport(orchestrator::RequestContext &context, engine::Response &response) {
