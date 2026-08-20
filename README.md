@@ -38,17 +38,42 @@ Platform HTTP clients (OkHttp, URLSession, `@ohos.net.http`) are black boxes —
 - **Per-request control** — force any protocol, skip automatic downgrade
 - **Host-level circuit breaker** — 3 consecutive failures = 60s cooldown per host
 
+### Smart DNS Resolution
+- **HTTPDNS → LocalDNS → Backup IP** three-tier fallback chain
+- **Health-based IP scoring** — RTT / loss / failure penalties, stable sort (best IP first)
+- **TTL cache** with stale-while-revalidate + LRU eviction, keyed by `network_epoch`
+- IP literal fast path + `prefetch` warm-up
+
+### Weak Network Detection & Optimization
+- **Quality scoring** — RTT / loss / bandwidth weighted, `UNKNOWN → HEALTHY → DEGRADED → BAD` state machine
+- **EMA-smoothed RTT** + passive observation via QUIC connection stats (zero probe overhead)
+- **Adaptive policy** — timeout / concurrency / retry tuned by live network quality
+
+### Connection Pool
+- **Lease model** — `acquire → use → release`, explicit lifecycle
+- **LRU eviction** + full cleanup on network change
+
+### Request Orchestration
+- **Interceptor chain** — weak-network guard + retry
+- **Retry** — exponential backoff + jitter, shared deadline, idempotency auto-detection
+- **Request coalescing** — GET/HEAD dedup, auth/proxy/CA isolated, header whitelist
+
 ### Security
 - TLS 1.3 with BoringSSL (same engine as Chromium)
 - Custom CA certificate bundle injection
 - Certificate verification callback (inspect chain before trust)
+- DNS SSRF protection — private/special IP filtering (IPv4 + 6 IPv6-embedded-IPv4 formats)
 - `allow_insecure_tls_for_testing` for local development
 
 ### Observability
-- Per-phase latency: DNS, Connect, TLS, TTFB, Total
-- Protocol used (even on fallback)
+- Per-phase latency: DNS, Connect, TLS, TTFB, Total (core + wall clock)
+- Protocol used (even on fallback) + fallback flag
 - Native log callback → integrate with any logging system
-- Diagnostics dump (connection pool, DNS cache)
+- Diagnostics dump (connection pool, DNS cache, quality snapshot)
+
+### Network Diagnostics
+- **Trace route** — per-hop TTL + per-probe RTT, timeout shown as `*` (no root required)
+- **Network change notification** — resets quality probe + connection pool on switch
 
 ### Platform Support
 | Platform | Status | SDK Format |
@@ -72,6 +97,20 @@ Platform HTTP clients (OkHttp, URLSession, `@ohos.net.http`) are black boxes —
 # 3. Install
 adb install -r examples/android/build/outputs/apk/debug/android-debug.apk
 ```
+
+The demo has three tabs:
+
+| Tab | What it shows |
+|-----|---------------|
+| **Presets** | One-tap scenarios (`Automatic GET`, `HTTP/1.1/2/3 GET`, `HTTP/2 POST`) with full per-phase timeline |
+| **Custom** | Build any request — method, protocol, headers, timeout, insecure TLS |
+| **Diagnostics** | Live network state, quality snapshot, trace route, diagnostics dump |
+
+<p align="left">
+  <img src="docs/images/Screenshot_20260820_115638.png" alt="Presets" width="200"/>
+  <img src="docs/images/Screenshot_20260820_115617.png" alt="Custom" width="200"/>
+  <img src="docs/images/Screenshot_20260820_115542.png" alt="Diagnostics" width="200"/>
+</p>
 
 ### C++ (Desktop)
 
@@ -173,7 +212,7 @@ sdk/                    SDK (deliverables)
 └── third_party/        Third-party: nghttp2, xquic, BoringSSL → independent .so
 
 examples/               Runnable examples
-├── android/            Android Demo (Presets + Custom Request tabs)
+├── android/            Android Demo (Presets + Custom + Diagnostics tabs)
 ├── cxx/                C++ unit tests
 ├── ios/                iOS Demo (SwiftUI)
 ├── harmonyos/          HarmonyOS Demo (ArkTS)
