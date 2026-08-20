@@ -107,9 +107,9 @@ Demo 有三个标签页：
 | **Diagnostics** | 实时网络状态、质量快照、trace route、诊断快照 |
 
 <p align="left">
-  <img src="docs/images/Screenshot_20260820_115638.png" alt="Presets" width="200"/>
-  <img src="docs/images/Screenshot_20260820_115617.png" alt="Custom" width="200"/>
-  <img src="docs/images/Screenshot_20260820_115542.png" alt="Diagnostics" width="200"/>
+  <img src="docs/images/Screenshot_20260820_131956.png" alt="Presets" width="200"/>
+  <img src="docs/images/Screenshot_20260820_132038.png" alt="Custom" width="200"/>
+  <img src="docs/images/Screenshot_20260820_132325.png" alt="Diagnostics" width="200"/>
 </p>
 
 ### C++（桌面端）

@@ -107,9 +107,9 @@ The demo has three tabs:
 | **Diagnostics** | Live network state, quality snapshot, trace route, diagnostics dump |
 
 <p align="left">
-  <img src="docs/images/Screenshot_20260820_115638.png" alt="Presets" width="200"/>
-  <img src="docs/images/Screenshot_20260820_115617.png" alt="Custom" width="200"/>
-  <img src="docs/images/Screenshot_20260820_115542.png" alt="Diagnostics" width="200"/>
+  <img src="docs/images/Screenshot_20260820_131956.png" alt="Presets" width="200"/>
+  <img src="docs/images/Screenshot_20260820_132038.png" alt="Custom" width="200"/>
+  <img src="docs/images/Screenshot_20260820_132325.png" alt="Diagnostics" width="200"/>
 </p>
 
 ### C++ (Desktop)
