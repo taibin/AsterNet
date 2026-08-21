@@ -188,6 +188,17 @@ client.close();
 
 详细分析见 [docs/OKHTTP_COMPARISON.md](docs/OKHTTP_COMPARISON.md)。
 
+**实测对比**（真实业务接口，HTTP/2，20 轮，Android 真机）：
+
+| 指标 | AsterNet 相对 OkHttp |
+|--------|-------|
+| 平均耗时 | 降低约 10% |
+| CPU 占用 | 降低约 19% |
+
+<p align="left">
+  <img src="docs/images/screenshot-20260821-112822.png" alt="OkHttp vs AsterNet 实测对比" width="260"/>
+</p>
+
 **关键差异：**
 
 1. **协议可见性** — OkHttp 把协议选择隐藏在拦截器之后；AsterNet 逐请求暴露 `protocol_policy`，并上报实际使用的协议。

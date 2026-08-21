@@ -188,6 +188,17 @@ See [API Reference](docs/API.md) for full details.
 
 See [docs/OKHTTP_COMPARISON.md](docs/OKHTTP_COMPARISON.md) for detailed analysis.
 
+**Measured comparison** (HTTP/2, 20 rounds, Android device):
+
+| Metric | AsterNet vs OkHttp |
+|--------|-------|
+| Avg latency | ~10% lower |
+| CPU usage | ~19% lower |
+
+<p align="left">
+  <img src="docs/images/screenshot-20260821-112822.png" alt="OkHttp vs AsterNet measured comparison" width="260"/>
+</p>
+
 **Key differences:**
 
 1. **Protocol visibility** — OkHttp hides protocol selection behind interceptors. AsterNet exposes `protocol_policy` per-request and reports actual protocol used.
